@@ -309,6 +309,21 @@ describe('twap', () => {
   });
 });
 
+describe('HIP-3 builder perps', () => {
+  it('apply the market fee multiplier and default to isolated margin', () => {
+    const e = mkEngine();
+    // XYZ-style stock perp: deployer share 100% (×2), growth mode (×0.1) => 0.2× base fees
+    e.setAssets([{ coin: 'xyz:TSLA', szDecimals: 3, maxLeverage: 20, tiers: [{ lowerBound: 0, maxLeverage: 20 }], onlyIsolated: true, dex: 'xyz', feeMult: 0.2 }]);
+    e.onBook({ coin: 'xyz:TSLA', time: T0, bids: [{ px: 399.9, sz: 50, n: 1 }], asks: [{ px: 400.1, sz: 50, n: 1 }] });
+    expect(e.levSetting('xyz:TSLA').mode).toBe('isolated');
+    expect(e.setLeverage('xyz:TSLA', 10, 'cross')).toMatch(/isolated-only/);
+    e.placeOrder({ coin: 'xyz:TSLA', side: 'B', kind: 'market', sz: 2.5 }, T0);
+    const f = e.state.fills[0];
+    expect(f.fee).toBeCloseTo(400.1 * 2.5 * 0.00045 * 0.2, 8);
+    expect(e.state.positions['xyz:TSLA'].mode).toBe('isolated');
+  });
+});
+
 describe('scale orders', () => {
   it('builds a linear-skew ladder that sums to the total', () => {
     const e = mkEngine();

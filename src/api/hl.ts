@@ -13,7 +13,11 @@ export interface RawAssetCtx {
   premium: string | null; oraclePx: string; markPx: string; midPx: string | null;
   impactPxs: string[] | null; dayBaseVlm: string;
 }
-export interface RawUniverseAsset { name: string; szDecimals: number; maxLeverage: number; marginTableId: number; isDelisted?: boolean; onlyIsolated?: boolean }
+export interface RawUniverseAsset {
+  name: string; szDecimals: number; maxLeverage: number; marginTableId: number; isDelisted?: boolean; onlyIsolated?: boolean;
+  /** HIP-3 only */
+  growthMode?: string; deployerFeeScale?: string; marginMode?: string;
+}
 export interface RawMarginTier { lowerBound: string; maxLeverage: number }
 export interface RawMeta {
   universe: RawUniverseAsset[];
@@ -35,7 +39,11 @@ export async function info<T>(body: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-export const fetchMetaAndCtxs = () => info<[RawMeta, RawAssetCtx[]]>({ type: 'metaAndAssetCtxs' });
+/** main perps when `dex` is omitted; a HIP-3 builder dex (e.g. "xyz") otherwise */
+export const fetchMetaAndCtxs = (dex?: string) => info<[RawMeta, RawAssetCtx[]]>(dex ? { type: 'metaAndAssetCtxs', dex } : { type: 'metaAndAssetCtxs' });
+export interface RawPerpDex { name: string; fullName: string; deployer: string }
+/** HIP-3 builder-deployed perp dexes; the first entry (null) is the main dex */
+export const fetchPerpDexs = () => info<(RawPerpDex | null)[]>({ type: 'perpDexs' });
 export const fetchSpotMetaAndCtxs = () => info<[RawSpotMeta, RawSpotCtx[]]>({ type: 'spotMetaAndAssetCtxs' });
 export const fetchFundingHistory = (coin: string, startTime: number, endTime: number) =>
   info<{ coin: string; fundingRate: string; premium: string; time: number }[]>({ type: 'fundingHistory', coin, startTime, endTime });

@@ -1,6 +1,6 @@
 import { useEffect, useReducer } from 'react';
 import { chooseInterval, replay, type Candle, type ReplayResult } from './engine/replay';
-import { HLSocket, fetchBook, fetchCandles, fetchFundingHistory, fetchMetaAndCtxs, fetchSpotMetaAndCtxs, type RawAssetCtx, type RawBook, type RawTrade, type WsStatus } from './api/hl';
+import { HLSocket, fetchBook, fetchCandles, fetchFundingHistory, fetchMetaAndCtxs, fetchPerpDexs, fetchSpotMetaAndCtxs, type RawMeta, type RawAssetCtx, type RawBook, type RawTrade, type WsStatus } from './api/hl';
 import { Engine, newState, DEFAULT_SETTINGS, type AssetInfo, type Book, type Ctx, type State, type Trade } from './engine/engine';
 
 const STORAGE_KEY = 'hlsim:state:v1';
@@ -95,6 +95,7 @@ class Store {
     if (!this.marketsByCoin.has(this.prefs.coin)) this.prefs.coin = 'BTC';
     this.syncSubscriptions();
     setInterval(() => this.refreshMarkets().catch(() => {}), 3_000);
+    setInterval(() => this.refreshHip3(), 30_000);
     setInterval(() => this.engine.tick(Date.now()), 50);
     setInterval(() => this.syncSubscriptions(), 1_000);
     setInterval(() => this.persist(), 1_000);
@@ -160,28 +161,43 @@ class Store {
 
   dismissCatchup() { this.catchup = null; this.notify(); }
 
+  hip3Rows: MarketRow[] = [];
+  private hip3Loaded = false;
+  /** HIP-3 dexes: names + full names, e.g. xyz → "XYZ" */
+  hip3Dexes: { name: string; fullName: string }[] = [];
+
+  /** load every HIP-3 builder dex's markets (polled every 30s to respect API rate limits) */
+  private async refreshHip3() {
+    try {
+      if (!this.hip3Dexes.length) {
+        const dexs = await fetchPerpDexs();
+        this.hip3Dexes = dexs.filter((d): d is NonNullable<typeof d> => !!d).map((d) => ({ name: d.name, fullName: d.fullName }));
+      }
+      const results = await Promise.allSettled(this.hip3Dexes.map((d) => fetchMetaAndCtxs(d.name)));
+      const rows: MarketRow[] = [];
+      results.forEach((r, i) => {
+        if (r.status === 'fulfilled') rows.push(...perpRows(r.value[0], r.value[1], {}, this.hip3Dexes[i].name));
+        else rows.push(...this.hip3Rows.filter((x) => x.dex === this.hip3Dexes[i].name)); // keep last known
+      });
+      // keep live WebSocket values for markets being streamed
+      for (const r of rows) {
+        const live = this.marketsByCoin.get(r.coin);
+        if (live && this.bookSubs.has(r.coin)) { r.markPx = live.markPx; r.oraclePx = live.oraclePx; r.funding = live.funding; }
+      }
+      this.hip3Rows = rows;
+      this.hip3Loaded = true;
+    } catch { /* HIP-3 is optional: main perps and spot still work */ }
+  }
+
   private async refreshMarkets(applyToEngine = true) {
     try {
       const [perp, spot] = await Promise.allSettled([fetchMetaAndCtxs(), fetchSpotMetaAndCtxs()]);
       if (perp.status === 'rejected') throw perp.reason;
-      const [meta, ctxs] = perp.value;
-      const tables = new Map(meta.marginTables.map(([id, t]) => [id, t.marginTiers]));
-      const rows: MarketRow[] = [];
       const ctxMap: Record<string, Ctx> = {};
-      meta.universe.forEach((u, i) => {
-        if (u.isDelisted) return;
-        const c: RawAssetCtx = ctxs[i];
-        const tiers = (tables.get(u.marginTableId) ?? [{ lowerBound: '0', maxLeverage: u.maxLeverage }])
-          .map((t) => ({ lowerBound: Number(t.lowerBound), maxLeverage: t.maxLeverage }));
-        const row: MarketRow = {
-          coin: u.name, szDecimals: u.szDecimals, maxLeverage: u.maxLeverage, tiers, onlyIsolated: u.onlyIsolated,
-          markPx: Number(c.markPx), oraclePx: Number(c.oraclePx), funding: Number(c.funding),
-          prevDayPx: Number(c.prevDayPx), dayNtlVlm: Number(c.dayNtlVlm), openInterest: Number(c.openInterest),
-          midPx: c.midPx ? Number(c.midPx) : null, display: `${u.name}-USD`,
-        };
-        rows.push(row);
-        ctxMap[u.name] = { markPx: row.markPx, oraclePx: row.oraclePx, funding: row.funding, midPx: row.midPx };
-      });
+      const rows: MarketRow[] = perpRows(perp.value[0], perp.value[1], ctxMap);
+      // HIP-3 builder perps (stocks, indices, commodities…), refreshed on their own slower cycle
+      if (!this.hip3Loaded) await this.refreshHip3();
+      for (const r of this.hip3Rows) { rows.push(r); ctxMap[r.coin] = { markPx: r.markPx, oraclePx: r.oraclePx, funding: r.funding, midPx: r.midPx }; }
       if (spot.status === 'fulfilled') {
         const [smeta, sctxs] = spot.value;
         const tokens = new Map(smeta.tokens.map((t) => [t.index, t]));
@@ -278,6 +294,33 @@ class Store {
       if (!this.warnedStorage) { this.warnedStorage = true; this.toast('reject', 'Could not save your account to browser storage (full or blocked).'); }
     }
   }
+}
+
+/**
+ * Perp market rows for the main dex or a HIP-3 dex.
+ * HIP-3 fees: base fee × (1 + deployer fee share), and ×0.1 for markets in growth mode.
+ * HIP-3 positions here are isolated-only (each builder dex has its own margin).
+ */
+function perpRows(meta: RawMeta, ctxs: RawAssetCtx[], ctxMap: Record<string, Ctx>, dex?: string): MarketRow[] {
+  const tables = new Map(meta.marginTables.map(([id, t]) => [id, t.marginTiers]));
+  const rows: MarketRow[] = [];
+  meta.universe.forEach((u, i) => {
+    const c = ctxs[i];
+    if (u.isDelisted || !c) return;
+    const tiers = (tables.get(u.marginTableId) ?? [{ lowerBound: '0', maxLeverage: u.maxLeverage }])
+      .map((t) => ({ lowerBound: Number(t.lowerBound), maxLeverage: t.maxLeverage }));
+    const feeMult = dex ? (1 + Number(u.deployerFeeScale ?? 1)) * (u.growthMode === 'enabled' ? 0.1 : 1) : undefined;
+    const row: MarketRow = {
+      coin: u.name, szDecimals: u.szDecimals, maxLeverage: u.maxLeverage, tiers,
+      onlyIsolated: dex ? true : u.onlyIsolated, dex, feeMult,
+      markPx: Number(c.markPx), oraclePx: Number(c.oraclePx), funding: Number(c.funding),
+      prevDayPx: Number(c.prevDayPx), dayNtlVlm: Number(c.dayNtlVlm), openInterest: Number(c.openInterest),
+      midPx: c.midPx ? Number(c.midPx) : null, display: `${u.name}-USD`,
+    };
+    rows.push(row);
+    ctxMap[u.name] = { markPx: row.markPx, oraclePx: row.oraclePx, funding: row.funding, midPx: row.midPx };
+  });
+  return rows;
 }
 
 export function parseBook(d: RawBook): Book {

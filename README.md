@@ -22,6 +22,7 @@ The app is fully client-side: your browser connects straight to Hyperliquid's pu
 | Area | Behavior |
 |---|---|
 | **Markets** | Every live Hyperliquid perp, with its real `szDecimals`, max leverage and margin tiers, plus every spot pair (HYPE/USDC, UBTC/USDC, PURR/USDC, …) |
+| **Stocks & HIP-3** | All HIP-3 markets that third parties run on Hyperliquid: stocks (TSLA, NVDA, MU…), indices (SP500, XYZ100…), commodities and more, from every HIP-3 exchange (xyz, para, mkts, io, …). Each market uses its real per-market fees: the base fee × (1 + the exchange's fee share), cut by 90% for markets in growth mode, so most stock markets come to about 0.009% taker. Margin is isolated-only, because each HIP-3 exchange has separate margin. All HIP-3 collateral is treated as USD. These markets refresh every 30 s, except the one you're viewing and any you hold, which stream live. |
 | **Spot** | Perps and spot have separate balances, as on Hyperliquid, and you move USDC between them with *Transfer*. Buys and sells fill against the live spot book. Fees default to 0.070% taker and 0.040% maker, and are taken from the token you receive. The **Balances** tab shows each holding's average cost and unrealized PnL. Pairs quoted in tokens other than USDC (e.g. USDT0) need that token first. |
 | **Scale orders** | Like Hyperliquid's: N limit orders (2–100) spaced evenly from a start price to an end price. Sizes grow linearly so the last order is *skew* × the first (skew 1 = equal sizes). Every rung must be at least $10, and each one then rests and fills with the normal queue simulation. While choosing a scale order, clicking the order book sets the start price, then the end price. |
 | **TWAP** | Like Hyperliquid's TWAP: one market sub-order every 30 s, with at most 3% slippage per sub-order. If earlier sub-orders didn't fill, later ones catch up, capped at 3× a normal slice. Optional size randomization. Duration is 5 min to 24 h, and each sub-order must be at least $10. The **TWAP** tab shows progress and average price. A running TWAP picks up again when you reopen the app. |
@@ -43,7 +44,7 @@ The app is fully client-side: your browser connects straight to Hyperliquid's pu
 ### Known limitations
 - Hyperliquid's public book feed shows the top 20 levels on each side. If a resting order sits deeper than that, its queue position is unknown until the price comes into view.
 - Your simulated orders don't move the real market. On illiquid coins, a fill you'd really get could push the price, and that impact isn't modelled after your own fill.
-- Partial liquidations and Hyperliquid's builder-deployed (HIP-3) perp markets aren't modelled yet.
+- Partial liquidations aren't modelled yet.
 - The account equity curve is sampled once a minute, and only while the app is open. Realized PnL, fees and funding come from the full trade history, which keeps the last 10,000 fills.
 
 ## Code layout

@@ -39,6 +39,10 @@ export interface AssetInfo {
   onlyIsolated?: boolean;
   /** present for spot pairs. `coin` is the exchange's pair id (e.g. "@107" or "PURR/USDC") */
   spot?: { name: string; base: string; quote: string };
+  /** HIP-3 builder dex name (e.g. "xyz"); undefined for the main perp dex */
+  dex?: string;
+  /** perp fee multiplier (HIP-3 deployer share and growth mode) */
+  feeMult?: number;
 }
 export interface Level { px: number; sz: number; n: number }
 export interface Book { coin: string; time: number; bids: Level[]; asks: Level[] }
@@ -720,7 +724,7 @@ export class Engine {
     if (lev > this.maxLeverageFor(o.coin, newNtl)) {
       return `Position notional exceeds max for ${lev}x leverage on ${o.coin} (max ${this.maxLeverageFor(o.coin, newNtl)}x at this size)`;
     }
-    const need = (incSz * refPx) / lev + incSz * refPx * this.state.settings.takerFee;
+    const need = (incSz * refPx) / lev + incSz * refPx * this.state.settings.takerFee * (this.assets.get(o.coin)?.feeMult ?? 1);
     const avail = this.summary().available;
     if (need > avail + 1e-6) return `Insufficient margin (need $${need.toFixed(2)}, available $${avail.toFixed(2)})`;
     return null;
@@ -840,7 +844,7 @@ export class Engine {
     if (sz <= EPS) return;
 
     const signed = sideSign(o.side) * sz;
-    const feeRate = liquidity === 'taker' ? s.settings.takerFee : s.settings.makerFee;
+    const feeRate = (liquidity === 'taker' ? s.settings.takerFee : s.settings.makerFee) * (a.feeMult ?? 1);
     const fee = px * sz * feeRate;
     const ls = this.levSetting(o.coin);
     let closedPnl = 0;

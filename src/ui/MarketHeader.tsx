@@ -24,7 +24,8 @@ export function MarketHeader() {
   return (
     <div className="mkthead">
       <button className="coinbtn" onClick={() => setOpen(!open)}>
-        {m.display} <span className="lev">{sp ? 'Spot' : `${m.maxLeverage}x`}</span> <span className="muted" style={{ fontSize: 12 }}>▾</span>
+        {m.display} <span className="lev">{sp ? 'Spot' : `${m.maxLeverage}x`}</span>
+        {m.dex && <span className="lev" title={`HIP-3 market deployed by ${s.hip3Dexes.find((d) => d.name === m.dex)?.fullName ?? m.dex}. Isolated margin only.`}>{m.dex} · isolated</span>} <span className="muted" style={{ fontSize: 12 }}>▾</span>
       </button>
       <div className="stat"><div className="k" title={sp ? 'Spot mark price' : 'Used for PnL, liquidations and TP/SL triggers'}>{sp ? 'Price' : 'Mark'}</div><div className="v num">{fmtPx(m.markPx, m.szDecimals, sp)}</div></div>
       {!sp && <div className="stat"><div className="k" title="Used for funding">Oracle</div><div className="v num">{fmtPx(m.oraclePx, m.szDecimals)}</div></div>}
@@ -38,27 +39,33 @@ export function MarketHeader() {
           <div className="stat"><div className="k" title="Hourly funding rate. Positive: longs pay shorts">Funding / Countdown</div><div className="v num"><span className={m.funding >= 0 ? 'up' : 'down'}>{(m.funding * 100).toFixed(4)}%</span> {mm}:{ss}</div></div>
         </>
       )}
-      {open && <MarketSelector initialTab={sp ? 'spot' : 'perps'} onClose={() => setOpen(false)} />}
+      {open && <MarketSelector initialTab={sp ? 'spot' : m.dex ? 'hip3' : 'perps'} onClose={() => setOpen(false)} />}
     </div>
   );
 }
 
-function MarketSelector({ onClose, initialTab }: { onClose: () => void; initialTab: 'perps' | 'spot' }) {
+type SelTab = 'perps' | 'hip3' | 'spot' | 'fav';
+function MarketSelector({ onClose, initialTab }: { onClose: () => void; initialTab: SelTab }) {
   const s = useStore();
   const [q, setQ] = useState('');
-  const [tab, setTab] = useState<'perps' | 'spot' | 'fav'>(initialTab);
+  const [tab, setTab] = useState<SelTab>(initialTab);
+  const [dex, setDex] = useState('all');
   const [sort, setSort] = useState<'vol' | 'change' | 'funding' | 'oi'>('vol');
   const rows = useMemo(() => {
     const ql = q.trim().toLowerCase();
     const r = s.markets.filter((m) => {
-      if (tab === 'fav' ? !s.prefs.favorites.includes(m.coin) : tab === 'spot' ? !m.spot : !!m.spot) return false;
+      const inTab = tab === 'fav' ? s.prefs.favorites.includes(m.coin)
+        : tab === 'spot' ? !!m.spot
+        : tab === 'hip3' ? !!m.dex && (dex === 'all' || m.dex === dex)
+        : !m.spot && !m.dex;
+      if (!inTab) return false;
       return !ql || m.display.toLowerCase().includes(ql) || m.coin.toLowerCase() === ql;
     });
     const key = (m: MarketRow) =>
       sort === 'vol' ? m.dayNtlVlm : sort === 'change' ? (m.prevDayPx ? m.markPx / m.prevDayPx - 1 : 0)
         : sort === 'funding' ? m.funding : m.spot ? (m.circulatingSupply ?? 0) * m.markPx : m.openInterest * m.markPx;
     return r.sort((a, b) => key(b) - key(a));
-  }, [s.markets, q, sort, tab, s.prefs.favorites]);
+  }, [s.markets, q, sort, tab, dex, s.prefs.favorites]);
   useEffect(() => {
     const k = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
     window.addEventListener('keydown', k);
@@ -76,8 +83,17 @@ function MarketSelector({ onClose, initialTab }: { onClose: () => void; initialT
         <div className="tabs">
           <button className={tab === 'fav' ? 'active' : ''} onClick={() => setTab('fav')}>Favorites</button>
           <button className={tab === 'perps' ? 'active' : ''} onClick={() => setTab('perps')}>Perps</button>
+          <button className={tab === 'hip3' ? 'active' : ''} onClick={() => setTab('hip3')}>Stocks &amp; HIP-3</button>
           <button className={tab === 'spot' ? 'active' : ''} onClick={() => setTab('spot')}>Spot</button>
         </div>
+        {tab === 'hip3' && (
+          <div className="tabs" style={{ flexWrap: 'wrap' }}>
+            <button className={dex === 'all' ? 'active' : ''} onClick={() => setDex('all')}>All</button>
+            {s.hip3Dexes.filter((d) => s.markets.some((m) => m.dex === d.name)).map((d) => (
+              <button key={d.name} className={dex === d.name ? 'active' : ''} onClick={() => setDex(d.name)} title={d.fullName}>{d.name}</button>
+            ))}
+          </div>
+        )}
         <div className="list">
           <table className="table">
             <thead><tr>

@@ -75,8 +75,9 @@ export function OrderForm() {
     : side === 'B' ? book?.asks[0]?.px ?? mid : book?.bids[0]?.px ?? mid;
   const baseName = spot?.base ?? coin;
   const quoteName = spot?.quote ?? 'USD';
-  const takerFee = sp ? e.state.settings.spotTakerFee : e.state.settings.takerFee;
-  const makerFee = sp ? e.state.settings.spotMakerFee : e.state.settings.makerFee;
+  const feeMult = m.feeMult ?? 1;
+  const takerFee = sp ? e.state.settings.spotTakerFee : e.state.settings.takerFee * feeMult;
+  const makerFee = sp ? e.state.settings.spotMakerFee : e.state.settings.makerFee * feeMult;
 
   // what you can trade right now
   let available: number; // in quote (buy) or USD margin
