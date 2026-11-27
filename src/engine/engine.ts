@@ -180,6 +180,8 @@ export interface State {
   twaps: Twap[];
   /** [time, total equity] samples for the equity curve */
   equityHist: [number, number][];
+  /** last time the app was running; catch-up replays history from here */
+  lastSeen?: number;
 }
 
 export interface OrderRequest {
@@ -239,7 +241,7 @@ export class Engine {
   books = new Map<string, Book>();
   ctxs = new Map<string, Ctx>();
   private consumed = new Map<string, Map<string, ConsumedEntry>>();
-  private pending: { at: number; run: () => void }[] = [];
+  private pending: { at: number; run: (at: number) => void }[] = [];
   private listeners = new Set<() => void>();
   private notifyQueued = false;
   /** user-facing notifications (fills, liquidations, rejections) */
@@ -464,11 +466,13 @@ export class Engine {
     for (const o of this.state.orders) {
       if (o.coin !== book.coin || o.status !== 'open' || o.kind !== 'limit') continue;
       touched = true;
-      o.queuePrevBook = o.queueAhead;
-      const levels = o.side === 'B' ? book.bids : book.asks;
-      const lvl = levels.find((l) => l.px === o.px);
-      if (lvl) o.queueAhead = Math.min(o.queueAhead, lvl.sz);
-      else if (this.withinVisible(levels, o.side, o.px)) o.queueAhead = 0;
+      if (!this.replaying) {
+        o.queuePrevBook = o.queueAhead;
+        const levels = o.side === 'B' ? book.bids : book.asks;
+        const lvl = levels.find((l) => l.px === o.px);
+        if (lvl) o.queueAhead = Math.min(o.queueAhead, lvl.sz);
+        else if (this.withinVisible(levels, o.side, o.px)) o.queueAhead = 0;
+      }
       // book crossed through our price -> we'd have been matched
       const best = o.side === 'B' ? book.asks[0]?.px : book.bids[0]?.px;
       if (best !== undefined && (o.side === 'B' ? best <= o.px : best >= o.px)) {
@@ -515,10 +519,10 @@ export class Engine {
     if (touched) { this.cleanup(); this.changed(); }
   }
 
-  onCtxs(ctxs: Record<string, Ctx>, now = Date.now()) {
+  onCtxs(ctxs: Record<string, Ctx>, now = Date.now(), opts: { liquidations?: boolean } = {}) {
     for (const [coin, c] of Object.entries(ctxs)) this.ctxs.set(coin, c);
     this.checkTriggers(now);
-    this.checkLiquidations(now);
+    if (opts.liquidations !== false) this.checkLiquidations(now);
     this.changed();
   }
 
@@ -528,7 +532,7 @@ export class Engine {
     if (this.pending.length) {
       const due = this.pending.filter((p) => p.at <= now);
       this.pending = this.pending.filter((p) => p.at > now);
-      for (const p of due) p.run();
+      for (const p of due) p.run(p.at);
     }
     for (const t of this.state.twaps) if (t.status === 'running' && now >= t.nextAt) this.stepTwap(t, now);
     const hour = Math.floor(now / 3_600_000);
@@ -539,14 +543,34 @@ export class Engine {
     }
   }
 
-  private schedule(run: () => void, now: number) {
-    const lat = this.state.settings.latencyMs;
-    if (lat <= 0) run();
+  private schedule(run: (at: number) => void, now: number) {
+    const lat = this.replaying ? 0 : this.state.settings.latencyMs;
+    if (lat <= 0) run(now);
     else {
       // jitter ±30% to mimic real network variance
       const j = lat * (0.7 + Math.random() * 0.6);
       this.pending.push({ at: now + j, run });
     }
+  }
+
+  // ------------------------------------------------------------ replay mode
+  /**
+   * While replaying history (catch-up after the app was closed) the books are
+   * synthetic, so they must not move queue positions, and there is no latency.
+   */
+  replaying = false;
+
+  /** a candle traded through these prices: resting orders strictly inside its range fill in full */
+  replayThrough(coin: string, low: number, high: number, time: number) {
+    let touched = false;
+    for (const o of this.state.orders) {
+      if (o.coin !== coin || o.status !== 'open' || o.kind !== 'limit') continue;
+      if ((o.side === 'B' && low < o.px) || (o.side === 'A' && high > o.px)) {
+        touched = true;
+        this.fillResting(o, o.sz, time);
+      }
+    }
+    if (touched) { this.cleanup(); this.changed(); }
   }
 
   // ----------------------------------------------------------------- orders
@@ -585,16 +609,16 @@ export class Engine {
     if (order.tpsl && a.spot && req.side !== 'B') return { ok: false, error: 'Spot TP/SL can only be attached to buys' };
     this.state.orders.push(order);
     this.changed();
-    this.schedule(() => this.arrive(order, Date.now()), now);
+    this.schedule((at) => this.arrive(order, at), now);
     return { ok: true, oid };
   }
 
   cancelOrder(oid: number, now = Date.now()) {
     const o = this.state.orders.find((x) => x.oid === oid);
     if (!o) return;
-    this.schedule(() => {
+    this.schedule((at) => {
       if (o.status === 'open' || o.status === 'pending') {
-        this.finish(o, 'canceled', 'Canceled', now);
+        this.finish(o, 'canceled', 'Canceled', at);
         this.cleanup();
         this.changed();
       }

@@ -37,6 +37,8 @@ export async function info<T>(body: unknown): Promise<T> {
 
 export const fetchMetaAndCtxs = () => info<[RawMeta, RawAssetCtx[]]>({ type: 'metaAndAssetCtxs' });
 export const fetchSpotMetaAndCtxs = () => info<[RawSpotMeta, RawSpotCtx[]]>({ type: 'spotMetaAndAssetCtxs' });
+export const fetchFundingHistory = (coin: string, startTime: number, endTime: number) =>
+  info<{ coin: string; fundingRate: string; premium: string; time: number }[]>({ type: 'fundingHistory', coin, startTime, endTime });
 export const fetchBook = (coin: string) => info<RawBook>({ type: 'l2Book', coin });
 export const fetchCandles = (coin: string, interval: string, startTime: number, endTime: number) =>
   info<RawCandle[]>({ type: 'candleSnapshot', req: { coin, interval, startTime, endTime } });

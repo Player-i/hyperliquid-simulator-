@@ -1,5 +1,6 @@
 import { useEffect, useReducer } from 'react';
-import { HLSocket, fetchMetaAndCtxs, fetchSpotMetaAndCtxs, type RawAssetCtx, type RawBook, type RawTrade, type WsStatus } from './api/hl';
+import { chooseInterval, replay, type Candle, type ReplayResult } from './engine/replay';
+import { HLSocket, fetchBook, fetchCandles, fetchFundingHistory, fetchMetaAndCtxs, fetchSpotMetaAndCtxs, type RawAssetCtx, type RawBook, type RawTrade, type WsStatus } from './api/hl';
 import { Engine, newState, DEFAULT_SETTINGS, type AssetInfo, type Book, type Ctx, type State, type Trade } from './engine/engine';
 
 const STORAGE_KEY = 'hlsim:state:v1';
@@ -26,8 +27,6 @@ function loadState(): State | undefined {
     }
     s.orders = s.orders.filter((o) => o.status === 'open');
     s.settings = { ...DEFAULT_SETTINGS, ...s.settings };
-    // TWAPs keep running across reloads, from where they left off
-    for (const t of s.twaps ?? []) if (t.status === 'running') t.nextAt = Date.now();
     return s;
   } catch { return undefined; }
 }
@@ -52,6 +51,8 @@ class Store {
   wsStatus: WsStatus = 'closed';
   toasts: Toast[] = [];
   ready = false;
+  /** catch-up replay of the time the app was closed */
+  catchup: { status: 'running'; from: number; to: number } | { status: 'done'; result: ReplayResult } | { status: 'failed'; msg: string } | null = null;
   error: string | null = null;
   private listeners = new Set<() => void>();
   private bookSubs = new Map<string, () => void>();
@@ -81,6 +82,14 @@ class Store {
 
   async start() {
     this.socket.connect();
+    // load markets without feeding today's prices to the engine yet: the
+    // catch-up must replay history first, in time order
+    await this.refreshMarkets(false);
+    try { await this.catchUp(); } catch (err) {
+      this.catchup = { status: 'failed', msg: `Couldn't replay the time the app was closed: ${String((err as Error)?.message ?? err)}` };
+      this.engine.replaying = false;
+    }
+    this.engine.state.lastSeen = Date.now();
     await this.refreshMarkets();
     this.ready = true;
     if (!this.marketsByCoin.has(this.prefs.coin)) this.prefs.coin = 'BTC';
@@ -91,11 +100,67 @@ class Store {
     setInterval(() => this.persist(), 1_000);
     this.engine.recordEquity();
     setInterval(() => this.engine.recordEquity(), 60_000);
-    window.addEventListener('beforeunload', () => { this.dirty = true; this.persist(); });
+    setInterval(() => { this.engine.state.lastSeen = Date.now(); this.dirty = true; }, 5_000);
+    window.addEventListener('beforeunload', () => { this.engine.state.lastSeen = Date.now(); this.dirty = true; this.persist(); });
     this.notify();
   }
 
-  private async refreshMarkets() {
+  /** coins whose history matters for the account: open orders, positions, running TWAPs */
+  private exposedCoins() {
+    const st = this.engine.state;
+    const set = new Set<string>();
+    for (const o of st.orders) if (o.status === 'open') set.add(o.coin);
+    for (const c of Object.keys(st.positions)) set.add(c);
+    for (const t of st.twaps) if (t.status === 'running') set.add(t.coin);
+    return [...set].filter((c) => this.marketsByCoin.has(c));
+  }
+
+  private async catchUp() {
+    const e = this.engine;
+    const from = e.state.lastSeen;
+    const to = Date.now();
+    if (!from || to - from < 60_000) return;
+    const coins = this.exposedCoins();
+    if (!coins.length) { e.state.lastFundingHour = Math.floor(to / 3_600_000); return; }
+    // coins we don't replay are valued at today's prices (no triggers run for them)
+    for (const [c, ctx] of Object.entries(this.latestCtx)) if (!coins.includes(c)) e.ctxs.set(c, ctx);
+    this.catchup = { status: 'running', from, to };
+    this.notify();
+    const [interval, ms] = chooseInterval(to - from);
+    const candles: Record<string, Candle[]> = {};
+    const books: Record<string, Book | undefined> = {};
+    const funding: Record<string, { time: number; rate: number }[]> = {};
+    await Promise.all(coins.map(async (coin) => {
+      const [cs, book] = await Promise.all([
+        fetchCandles(coin, interval, from - ms, to).catch(() => []),
+        fetchBook(coin).then(parseBook).catch(() => undefined),
+      ]);
+      candles[coin] = cs.map((c) => ({ t: c.t, o: Number(c.o), h: Number(c.h), l: Number(c.l), c: Number(c.c) })).sort((a, b) => a.t - b.t);
+      books[coin] = book;
+      if (!this.marketsByCoin.get(coin)?.spot && e.state.positions[coin]) {
+        const list: { time: number; rate: number }[] = [];
+        let start = from;
+        for (let page = 0; page < 20 && start < to; page++) {
+          const rows = await fetchFundingHistory(coin, start, to).catch(() => []);
+          for (const r of rows) list.push({ time: r.time, rate: Number(r.fundingRate) });
+          if (rows.length < 500) break;
+          start = rows[rows.length - 1].time + 1;
+        }
+        funding[coin] = list;
+      }
+    }));
+    const result = replay(e, { from, to, intervalMs: ms, candles, books, funding });
+    this.catchup = { status: 'done', result };
+    this.dirty = true;
+    this.persist();
+    this.notify();
+  }
+
+  private latestCtx: Record<string, Ctx> = {};
+
+  dismissCatchup() { this.catchup = null; this.notify(); }
+
+  private async refreshMarkets(applyToEngine = true) {
     try {
       const [perp, spot] = await Promise.allSettled([fetchMetaAndCtxs(), fetchSpotMetaAndCtxs()]);
       if (perp.status === 'rejected') throw perp.reason;
@@ -138,7 +203,8 @@ class Store {
       this.markets = rows;
       this.marketsByCoin = new Map(rows.map((r) => [r.coin, r]));
       this.engine.setAssets(rows);
-      this.engine.onCtxs(ctxMap);
+      this.latestCtx = ctxMap;
+      if (applyToEngine) this.engine.onCtxs(ctxMap);
       this.error = null;
     } catch (e) {
       this.error = 'Cannot reach Hyperliquid API';

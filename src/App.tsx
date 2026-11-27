@@ -5,7 +5,7 @@ import { OrderBookPanel } from './ui/OrderBook';
 import { OrderForm } from './ui/OrderForm';
 import { BottomPanel } from './ui/BottomPanel';
 import { MarketHeader } from './ui/MarketHeader';
-import { SettingsModal } from './ui/Modals';
+import { AwayModal, SettingsModal, fmtDuration } from './ui/Modals';
 import { Portfolio } from './ui/Portfolio';
 import { fmtPct, fmtUsd } from './ui/format';
 
@@ -47,7 +47,9 @@ export function App() {
         </div>
         {s.prefs.view === 'trade' && <MarketHeader />}
       </div>
-      {!s.ready ? <div className="empty">{bootError ? '' : 'Loading Hyperliquid markets…'}</div> : s.prefs.view === 'portfolio' ? <Portfolio /> : <div className="main">
+      {!s.ready ? <div className="empty">{bootError ? '' : s.catchup?.status === 'running'
+        ? `Catching up on ${fmtDuration(s.catchup.to - s.catchup.from)} of market history while the app was closed…`
+        : 'Loading Hyperliquid markets…'}</div> : s.prefs.view === 'portfolio' ? <Portfolio /> : <div className="main">
         <div className="panel chartwrap"><Chart /></div>
         <div className="panel bookwrap"><OrderBookPanel /></div>
         <div className="panel formwrap"><OrderForm /></div>
@@ -57,6 +59,8 @@ export function App() {
         {s.toasts.map((t) => <div key={t.id} className={`toast ${t.type}`}>{t.msg}</div>)}
       </div>
       {settings && <SettingsModal onClose={() => setSettings(false)} />}
+      {s.ready && s.catchup?.status === 'done' && <AwayModal result={s.catchup.result} onClose={() => s.dismissCatchup()} />}
+      {s.ready && s.catchup?.status === 'failed' && <div className="banner">{s.catchup.msg} <button className="btn small" onClick={() => s.dismissCatchup()}>Dismiss</button></div>}
     </div>
   );
 }

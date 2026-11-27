@@ -1,7 +1,8 @@
 import { useState, type ReactNode } from 'react';
 import type { MarginMode, Side } from '../engine/engine';
+import type { ReplayResult } from '../engine/replay';
 import { useStore } from '../store';
-import { fmtPx, fmtUsd } from './format';
+import { fmtDateTime, fmtPx, fmtSigned, fmtUsd, pnlClass } from './format';
 
 function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
   return (
@@ -79,6 +80,49 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       <button className="btn danger" onClick={() => {
         if (confirm('Reset account? This clears all positions, orders and history.')) { s.engine.reset(parsed()); onClose(); }
       }}>Reset account</button>
+    </Modal>
+  );
+}
+
+export function fmtDuration(ms: number) {
+  const m = Math.round(ms / 60_000);
+  const d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60;
+  return [d && `${d}d`, h && `${h}h`, (mm || (!d && !h)) && `${mm}m`].filter(Boolean).join(' ');
+}
+
+/** summary of what the catch-up replay did while the app was closed */
+export function AwayModal({ result, onClose }: { result: ReplayResult; onClose: () => void }) {
+  const r = result;
+  const net = r.realized - r.fees + r.fundingNet;
+  const interesting = r.events.filter((x) => x.type !== 'reject' || !/No order book/.test(x.msg));
+  return (
+    <Modal title={`While you were away (${fmtDuration(r.to - r.from)})`} onClose={onClose}>
+      <div className="muted">
+        Replayed Hyperliquid's {r.intervalMs >= 3_600_000 ? `${r.intervalMs / 3_600_000}h` : `${r.intervalMs / 60_000}m`} price history from {fmtDateTime(r.from)} to {fmtDateTime(r.to)} against your orders and positions.
+      </div>
+      <div className="kv"><span>Equity</span><span className="v num">{fmtUsd(r.equityBefore)} → {fmtUsd(r.equityAfter)}</span></div>
+      <div className="kv"><span>Fills</span><span className="v num">{r.fills}</span></div>
+      <div className="kv"><span>Realized PnL</span><span className={`v num ${pnlClass(r.realized)}`}>{fmtSigned(r.realized)}</span></div>
+      <div className="kv"><span>Fees</span><span className="v num">{fmtUsd(-r.fees)}</span></div>
+      <div className="kv"><span>Funding ({r.fundingCount} payments)</span><span className={`v num ${pnlClass(r.fundingNet)}`}>{fmtSigned(r.fundingNet)}</span></div>
+      <div className="kv"><span>Net</span><span className={`v num ${pnlClass(net)}`}><b>{fmtSigned(net)}</b></span></div>
+      {interesting.length > 0 ? (
+        <div className="tablewrap" style={{ maxHeight: 260, border: '1px solid var(--border)', borderRadius: 6 }}>
+          <table className="table">
+            <tbody>
+              {interesting.map((x, i) => (
+                <tr key={i}>
+                  <td className="faint">{fmtDateTime(x.time)}</td>
+                  <td className={x.type === 'liquidation' ? 'down' : x.type === 'reject' ? 'warn' : ''} style={{ whiteSpace: 'normal' }}>{x.msg}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : <div className="muted">None of your orders triggered or filled.</div>}
+      {r.missing.length > 0 && <div className="warn">No price history was available for: {r.missing.join(', ')}. Those were not replayed.</div>}
+      <div className="faint">Limit orders fill only if the price traded through them. TP/SL and stops fire at the first minute the price crossed them; if a TP and SL fall in the same candle, the stop is assumed to hit first. Liquidations use candle closes.</div>
+      <button className="btn primary" onClick={onClose}>Got it</button>
     </Modal>
   );
 }
