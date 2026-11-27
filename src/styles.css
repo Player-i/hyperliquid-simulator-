@@ -51,7 +51,7 @@ input, select { font: inherit; color: var(--text); }
 .panel { background: var(--panel); border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .chartwrap { grid-column: 1; grid-row: 1; }
 .bookwrap { grid-column: 2; grid-row: 1; }
-.formwrap { grid-column: 3; grid-row: 1 / span 2; overflow-y: auto; }
+.formwrap { grid-column: 3; grid-row: 1 / span 2; overflow-y: auto; overflow-x: hidden; }
 .bottomwrap { grid-column: 1 / span 2; grid-row: 2; }
 
 .mkthead { display: flex; align-items: center; gap: 22px; padding: 8px 14px; border-bottom: 1px solid var(--border); overflow-x: auto; white-space: nowrap; }
@@ -93,10 +93,10 @@ input, select { font: inherit; color: var(--text); }
 .seg button.active { background: var(--bg); color: var(--text); }
 .seg button.buy.active { background: var(--up); color: #032018; font-weight: 600; }
 .seg button.sell.active { background: var(--down); color: #2a0409; font-weight: 600; }
-.field { display: flex; align-items: center; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 0 10px; }
+.field { min-width: 0; display: flex; align-items: center; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 0 10px; }
 .field:focus-within { border-color: var(--accent); }
 .field label { color: var(--muted); white-space: nowrap; }
-.field input { flex: 1; background: none; border: 0; outline: none; text-align: right; padding: 9px 6px; min-width: 0; }
+.field input { flex: 1; width: 100%; background: none; border: 0; outline: none; text-align: right; padding: 9px 6px; min-width: 0; }
 .field .unit { color: var(--muted); }
 .field select { background: none; border: 0; outline: none; color: var(--text); }
 .field select option { background: var(--panel); }
@@ -154,4 +154,29 @@ input, select { font: inherit; color: var(--text); }
   .topbar { gap: 8px; }
   .chartwrap, .bookwrap, .formwrap, .bottomwrap { grid-column: 1; }
   .chartwrap { grid-row: 1; } .formwrap { grid-row: 2; overflow: visible; } .bookwrap { grid-row: 3; } .bottomwrap { grid-row: 4; }
+}
+
+/* ---------------------------------------------------------------- portfolio */
+.viewtabs { display: flex; gap: 2px; margin-left: 12px; }
+.viewtabs button { background: none; border: 0; padding: 6px 10px; border-radius: 6px; color: var(--muted); }
+.viewtabs button.active { color: var(--text); background: var(--panel-2); }
+.portfolio { padding: 14px; display: flex; flex-direction: column; gap: 12px; max-width: 1500px; width: 100%; margin: 0 auto; overflow-y: auto; }
+.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.filters .seg button { padding: 6px 10px; }
+.datefield { padding: 0 8px; }
+.datefield input { padding: 6px 4px; text-align: left; color-scheme: dark; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; }
+.stat-tile { padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
+.tile-v { font-size: 16px; font-weight: 600; }
+.charts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.chartcard { padding: 12px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.cardhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; min-height: 40px; }
+.cardtitle { font-weight: 600; font-size: 13px; }
+.minichart { height: 220px; }
+@media (max-width: 1100px) { .charts { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 700px) {
+  .portfolio { padding: 10px 16px; }
+  .filters .seg { width: 100%; }
+  .viewtabs { margin-left: 0; }
 }

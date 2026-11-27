@@ -6,6 +6,7 @@ import { OrderForm } from './ui/OrderForm';
 import { BottomPanel } from './ui/BottomPanel';
 import { MarketHeader } from './ui/MarketHeader';
 import { SettingsModal } from './ui/Modals';
+import { Portfolio } from './ui/Portfolio';
 import { fmtPct, fmtUsd } from './ui/format';
 
 export function App() {
@@ -20,6 +21,10 @@ export function App() {
     <div className="app">
       <div className="topbar">
         <div className="brand">HL Paper Trader<span>simulated · live Hyperliquid data</span></div>
+        <div className="viewtabs">
+          <button className={s.prefs.view === 'trade' ? 'active' : ''} onClick={() => s.setView('trade')}>Trade</button>
+          <button className={s.prefs.view === 'portfolio' ? 'active' : ''} onClick={() => s.setView('portfolio')}>PnL Tracker</button>
+        </div>
         <div className="spacer" />
         <span className="pill num">Equity {fmtUsd(sum.equity)} <span className={sum.pnlSinceStart >= 0 ? 'up' : 'down'}>({fmtPct(sum.pnlSinceStart / s.engine.state.settings.startingBalance)})</span></span>
         <span className="pill"><span className="dot" style={{ background: wsColor }} />{s.wsStatus === 'open' ? 'Live' : s.wsStatus}</span>
@@ -33,16 +38,16 @@ export function App() {
             if (!m) return null;
             const ch = m.prevDayPx ? m.markPx / m.prevDayPx - 1 : 0;
             return (
-              <button key={c} onClick={() => s.setCoin(c)}>
-                <b style={{ color: c === s.prefs.coin ? 'var(--accent)' : undefined }}>{c}</b>{' '}
+              <button key={c} onClick={() => { s.setCoin(c); s.setView('trade'); }}>
+                <b style={{ color: c === s.prefs.coin ? 'var(--accent)' : undefined }}>{m.spot ? m.spot.name : c}</b>{' '}
                 <span className={ch >= 0 ? 'up' : 'down'}>{fmtPct(ch)}</span>
               </button>
             );
           })}
         </div>
-        <MarketHeader />
+        {s.prefs.view === 'trade' && <MarketHeader />}
       </div>
-      {!s.ready ? <div className="empty">{bootError ? '' : 'Loading Hyperliquid markets…'}</div> : <div className="main">
+      {!s.ready ? <div className="empty">{bootError ? '' : 'Loading Hyperliquid markets…'}</div> : s.prefs.view === 'portfolio' ? <Portfolio /> : <div className="main">
         <div className="panel chartwrap"><Chart /></div>
         <div className="panel bookwrap"><OrderBookPanel /></div>
         <div className="panel formwrap"><OrderForm /></div>

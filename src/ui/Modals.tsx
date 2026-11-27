@@ -56,16 +56,21 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [taker, setTaker] = useState(String(st.takerFee * 100));
   const [maker, setMaker] = useState(String(st.makerFee * 100));
   const [lat, setLat] = useState(String(st.latencyMs));
+  const [sTaker, setSTaker] = useState(String(st.spotTakerFee * 100));
+  const [sMaker, setSMaker] = useState(String(st.spotMakerFee * 100));
   const [slip, setSlip] = useState(String(st.marketSlippage * 100));
   const parsed = () => ({
-    takerFee: Number(taker) / 100, makerFee: Number(maker) / 100, latencyMs: Math.max(0, Number(lat) || 0),
+    takerFee: Number(taker) / 100, makerFee: Number(maker) / 100,
+    spotTakerFee: Number(sTaker) / 100, spotMakerFee: Number(sMaker) / 100, latencyMs: Math.max(0, Number(lat) || 0),
     marketSlippage: Math.max(0.001, Number(slip) / 100), startingBalance: Math.max(1, Number(bal) || 10_000),
   });
   return (
     <Modal title="Simulator Settings" onClose={onClose}>
       <div className="field"><label>Taker fee</label><input value={taker} onChange={(e) => setTaker(e.target.value)} /><span className="unit">%</span></div>
       <div className="field"><label>Maker fee</label><input value={maker} onChange={(e) => setMaker(e.target.value)} /><span className="unit">%</span></div>
-      <div className="muted">Hyperliquid base tier: 0.045% taker / 0.015% maker. Higher volume tiers are cheaper; set negative maker fee for rebates.</div>
+      <div className="field"><label>Spot taker fee</label><input value={sTaker} onChange={(e) => setSTaker(e.target.value)} /><span className="unit">%</span></div>
+      <div className="field"><label>Spot maker fee</label><input value={sMaker} onChange={(e) => setSMaker(e.target.value)} /><span className="unit">%</span></div>
+      <div className="muted">Hyperliquid base tier: perps 0.045% taker / 0.015% maker, spot 0.070% / 0.040%. Higher volume tiers are cheaper; set a negative maker fee for rebates.</div>
       <div className="field"><label>Network latency</label><input value={lat} onChange={(e) => setLat(e.target.value)} /><span className="unit">ms</span></div>
       <div className="field"><label>Market order max slippage</label><input value={slip} onChange={(e) => setSlip(e.target.value)} /><span className="unit">%</span></div>
       <button className="btn" onClick={() => { s.engine.updateSettings(parsed()); onClose(); }}>Save settings</button>
@@ -74,6 +79,35 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       <button className="btn danger" onClick={() => {
         if (confirm('Reset account? This clears all positions, orders and history.')) { s.engine.reset(parsed()); onClose(); }
       }}>Reset account</button>
+    </Modal>
+  );
+}
+
+export function TransferModal({ onClose }: { onClose: () => void }) {
+  const s = useStore();
+  const e = s.engine;
+  const [toSpot, setToSpot] = useState(true);
+  const [amt, setAmt] = useState('');
+  const max = toSpot ? e.summary().available : e.spotAvailable('USDC');
+  const apply = () => {
+    const err = e.transfer(Number(amt) || 0, toSpot);
+    if (err) s.toast('reject', err);
+    else { s.toast('info', `Transferred $${Number(amt).toFixed(2)} to ${toSpot ? 'Spot' : 'Perps'}`); onClose(); }
+  };
+  return (
+    <Modal title="Transfer USDC" onClose={onClose}>
+      <div className="muted">Like on Hyperliquid, perps and spot are separate balances. Move USDC between them here.</div>
+      <div className="seg">
+        <button className={toSpot ? 'active' : ''} onClick={() => setToSpot(true)}>Perps → Spot</button>
+        <button className={!toSpot ? 'active' : ''} onClick={() => setToSpot(false)}>Spot → Perps</button>
+      </div>
+      <div className="field">
+        <label>Amount</label>
+        <input inputMode="decimal" value={amt} onChange={(ev) => setAmt(ev.target.value)} placeholder="0.00" />
+        <button className="btn small" onClick={() => setAmt(String(Math.floor(max * 100) / 100))}>Max</button>
+      </div>
+      <div className="kv"><span>Available</span><span className="v num">{fmtUsd(max)}</span></div>
+      <button className="btn primary" onClick={apply}>Transfer</button>
     </Modal>
   );
 }

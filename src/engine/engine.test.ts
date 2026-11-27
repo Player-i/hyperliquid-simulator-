@@ -213,3 +213,87 @@ describe('pnl, triggers, liquidation, funding', () => {
     expect(e.state.cash).toBeGreaterThan(9_990);
   });
 });
+
+describe('spot', () => {
+  function spotEngine() {
+    const e = mkEngine();
+    e.setAssets([{ coin: '@107', szDecimals: 2, maxLeverage: 1, tiers: [], spot: { name: 'HYPE/USDC', base: 'HYPE', quote: 'USDC' } }]);
+    e.onBook({ coin: '@107', time: T0, bids: [{ px: 39.99, sz: 100, n: 1 }], asks: [{ px: 40.01, sz: 10, n: 1 }, { px: 40.05, sz: 100, n: 1 }] });
+    return e;
+  }
+
+  it('requires USDC to be transferred to spot first', () => {
+    const e = spotEngine();
+    const msgs: string[] = [];
+    e.onEvent = (ev) => msgs.push(ev.msg);
+    e.placeOrder({ coin: '@107', side: 'B', kind: 'market', sz: 1 }, T0);
+    expect(msgs[0]).toMatch(/Insufficient USDC/);
+    expect(e.transfer(1000, true)).toBeNull();
+    expect(e.state.cash).toBe(9000);
+    expect(e.state.spot.USDC).toBe(1000);
+  });
+
+  it('buys with fee taken in the received token and realizes average-cost pnl', () => {
+    const e = spotEngine();
+    e.transfer(1000, true);
+    e.placeOrder({ coin: '@107', side: 'B', kind: 'market', sz: 15 }, T0);
+    expect(e.state.spot.USDC).toBeCloseTo(1000 - (10 * 40.01 + 5 * 40.05), 6);
+    expect(e.state.spot.HYPE).toBeCloseTo(15 * (1 - 0.0007), 8);
+    expect(e.state.positions['@107']).toBeUndefined();
+    const avg = (10 * 40.01 + 5 * 40.05) / 15;
+    e.onBook({ coin: '@107', time: T0 + 1000, bids: [{ px: 45, sz: 100, n: 1 }], asks: [{ px: 45.01, sz: 100, n: 1 }] });
+    e.placeOrder({ coin: '@107', side: 'A', kind: 'market', sz: 10 }, T0 + 1000);
+    expect(e.state.fills[0].closedPnl).toBeCloseTo((45 - avg) * 10, 6);
+    expect(e.state.fills[0].fee).toBeCloseTo(450 * 0.0007, 8);
+    expect(e.state.fills[0].spot).toBe(true);
+    // equity counts HYPE at the USDC pair mid
+    expect(e.summary().spotValue).toBeGreaterThan(e.state.spot.USDC);
+  });
+
+  it('holds balance for resting orders and rejects selling more than owned', () => {
+    const e = spotEngine();
+    e.transfer(500, true);
+    e.placeOrder({ coin: '@107', side: 'B', kind: 'limit', px: 39, sz: 10 }, T0);
+    expect(e.spotAvailable('USDC')).toBeCloseTo(110, 6);
+    const msgs: string[] = [];
+    e.onEvent = (ev) => msgs.push(ev.msg);
+    e.placeOrder({ coin: '@107', side: 'A', kind: 'limit', px: 50, sz: 1 }, T0);
+    expect(msgs[0]).toMatch(/Insufficient HYPE/);
+  });
+});
+
+describe('twap', () => {
+  it('slices into 30s market sub-orders over the duration', () => {
+    const e = mkEngine(100_000);
+    e.onBook(book(T0, [[59999, 10]], [[60001, 10]]));
+    const r = e.placeTwap({ coin: 'BTC', side: 'B', sz: 1, minutes: 5 }, T0);
+    expect(r.ok).toBe(true);
+    for (let i = 0; i < 12; i++) {
+      e.onBook(book(T0 + i * 30_000, [[59999, 10]], [[60001, 10]]));
+      e.tick(T0 + i * 30_000);
+    }
+    const t = e.state.twaps[0];
+    expect(t.filledSz).toBeCloseTo(1, 6);
+    expect(t.status).toBe('completed');
+    expect(e.state.positions.BTC.szi).toBeCloseTo(1, 6);
+    expect(e.state.fills.filter((f) => f.twapId === t.id).length).toBe(10);
+    expect(e.state.history.length).toBe(0); // sub-orders stay out of order history
+  });
+
+  it('catches up on missed size, capped at 3x a slice', () => {
+    const e = mkEngine(100_000);
+    e.onCtxs({ BTC: { markPx: 60000, oraclePx: 60000, funding: 0, midPx: 60000 } }, T0);
+    e.placeTwap({ coin: 'BTC', side: 'B', sz: 1, minutes: 5 }, T0);
+    e.tick(T0); // no book yet -> slice rejected
+    expect(e.state.twaps[0].filledSz).toBe(0);
+    e.onBook(book(T0 + 150_000, [[59999, 10]], [[60001, 10]]));
+    e.tick(T0 + 150_000); // 6 slices due, capped at 3
+    expect(e.state.twaps[0].filledSz).toBeCloseTo(0.3, 6);
+  });
+
+  it('rejects sub-orders under $10', () => {
+    const e = mkEngine();
+    e.onBook(BOOK);
+    expect(e.placeTwap({ coin: 'BTC', side: 'B', sz: 0.001, minutes: 60 }, T0).ok).toBe(false);
+  });
+});

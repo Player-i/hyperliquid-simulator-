@@ -20,6 +20,11 @@ export interface RawMeta {
   marginTables: [number, { description: string; marginTiers: RawMarginTier[] }][];
 }
 
+export interface RawSpotToken { name: string; szDecimals: number; index: number; fullName: string | null }
+export interface RawSpotPair { name: string; tokens: [number, number]; index: number; isCanonical: boolean }
+export interface RawSpotMeta { tokens: RawSpotToken[]; universe: RawSpotPair[] }
+export interface RawSpotCtx { coin: string; markPx: string; midPx: string | null; prevDayPx: string; dayNtlVlm: string; circulatingSupply: string }
+
 export async function info<T>(body: unknown): Promise<T> {
   const res = await fetch(INFO_URL, {
     method: 'POST',
@@ -31,6 +36,7 @@ export async function info<T>(body: unknown): Promise<T> {
 }
 
 export const fetchMetaAndCtxs = () => info<[RawMeta, RawAssetCtx[]]>({ type: 'metaAndAssetCtxs' });
+export const fetchSpotMetaAndCtxs = () => info<[RawSpotMeta, RawSpotCtx[]]>({ type: 'spotMetaAndAssetCtxs' });
 export const fetchBook = (coin: string) => info<RawBook>({ type: 'l2Book', coin });
 export const fetchCandles = (coin: string, interval: string, startTime: number, endTime: number) =>
   info<RawCandle[]>({ type: 'candleSnapshot', req: { coin, interval, startTime, endTime } });
@@ -97,6 +103,7 @@ export class HLSocket {
       case 'l2Book': key = subKey({ type: 'l2Book', coin: data.coin }); break;
       case 'trades': if (data.length) key = subKey({ type: 'trades', coin: data[0].coin }); break;
       case 'candle': key = subKey({ type: 'candle', coin: data.s, interval: data.i }); break;
+      case 'activeSpotAssetCtx':
       case 'activeAssetCtx': key = subKey({ type: 'activeAssetCtx', coin: data.coin }); break;
       case 'allMids': key = subKey({ type: 'allMids' }); break;
     }

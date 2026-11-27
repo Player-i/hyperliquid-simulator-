@@ -37,14 +37,17 @@ function OrderBook() {
   const coin = s.prefs.coin;
   const m = s.marketsByCoin.get(coin);
   const szD = m?.szDecimals ?? 2;
+  const sp = !!m?.spot;
+  const base = m?.spot?.base ?? coin;
+  const quoteUnit = m?.spot?.quote ?? 'USD';
   const book = s.engine.books.get(coin);
   const [mult, setMult] = useState(1);
   const [inUsd, setInUsd] = useState(false);
-  const base = tickFor(book?.bids[0]?.px ?? m?.markPx ?? 1, szD);
-  const step = base * mult;
+  const tick = tickFor(book?.bids[0]?.px ?? m?.markPx ?? 1, szD, sp);
+  const step = tick * mult;
   const myPx = useMemo(() => new Set(s.engine.state.orders.filter((o) => o.coin === coin && o.status === 'open' && !o.trigger).map((o) => o.px)), [s.engine.state.orders, coin, book]);
 
-  if (!book) return <div className="empty">Connecting to live {coin} order book…</div>;
+  if (!book) return <div className="empty">Connecting to live {s.display(coin)} order book…</div>;
 
   const bids = group(book.bids, step, 'bid').slice(0, ROWS);
   const asks = group(book.asks, step, 'ask').slice(0, ROWS);
@@ -54,8 +57,9 @@ function OrderBook() {
   const spread = asks[0] && bids[0] ? book.asks[0].px - book.bids[0].px : 0;
   const mid = book.asks[0] && book.bids[0] ? (book.asks[0].px + book.bids[0].px) / 2 : 0;
   const stepDecimals = Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
-  const fmtStepPx = (px: number) => px.toLocaleString('en-US', { minimumFractionDigits: Math.min(stepDecimals, pxDecimals(px, szD)), maximumFractionDigits: Math.min(stepDecimals, pxDecimals(px, szD)) });
+  const fmtStepPx = (px: number) => px.toLocaleString('en-US', { minimumFractionDigits: Math.min(stepDecimals, pxDecimals(px, szD, sp)), maximumFractionDigits: Math.min(stepDecimals, pxDecimals(px, szD, sp)) });
   const fmtSize = (v: number) => (inUsd ? Math.round(v).toLocaleString('en-US') : fmtSz(v, szD));
+  const unit = inUsd ? quoteUnit : base;
 
   const row = (l: Level, total: number, side: 'bid' | 'ask') => (
     <div key={l.px} className={`row ${myPx.has(l.px) ? 'mine' : ''}`} onClick={() => bookClick.setPrice(l.px)} title={`${l.n} orders`}>
@@ -70,17 +74,17 @@ function OrderBook() {
     <div className="book">
       <div className="tabs" style={{ borderBottom: 0, paddingTop: 4 }}>
         <select className="btn small" value={mult} onChange={(e) => setMult(Number(e.target.value))}>
-          {[1, 2, 5, 10, 100, 1000].map((x) => <option key={x} value={x}>{Number((base * x).toPrecision(6))}</option>)}
+          {[1, 2, 5, 10, 100, 1000].map((x) => <option key={x} value={x}>{Number((tick * x).toPrecision(6))}</option>)}
         </select>
         <div className="right">
-          <button className="btn small" onClick={() => setInUsd(!inUsd)}>{inUsd ? 'USD' : coin}</button>
+          <button className="btn small" onClick={() => setInUsd(!inUsd)}>{unit}</button>
         </div>
       </div>
-      <div className="hdr"><span>Price</span><span>Size ({inUsd ? 'USD' : coin})</span><span>Total</span></div>
+      <div className="hdr"><span>Price</span><span>Size ({unit})</span><span>Total</span></div>
       <div className="side asks">{asks.map((l, i) => ({ l, t: askCum[i] })).reverse().map(({ l, t }) => row(l, t, 'ask'))}</div>
       <div className="spread num">
         <span>Spread</span>
-        <span>{fmtPx(spread, szD)} ({mid ? ((spread / mid) * 100).toFixed(3) : '0'}%)</span>
+        <span>{fmtPx(spread, szD, sp)} ({mid ? ((spread / mid) * 100).toFixed(3) : '0'}%)</span>
       </div>
       <div className="side">{bids.map((l, i) => row(l, bidCum[i], 'bid'))}</div>
     </div>
@@ -90,14 +94,16 @@ function OrderBook() {
 function Tape() {
   const s = useStore();
   const coin = s.prefs.coin;
-  const szD = s.marketsByCoin.get(coin)?.szDecimals ?? 2;
+  const m = s.marketsByCoin.get(coin);
+  const szD = m?.szDecimals ?? 2;
+  const sp = !!m?.spot;
   const trades = s.trades.get(coin) ?? [];
   return (
     <div className="tape">
-      <div className="row muted" style={{ paddingTop: 6 }}><span>Price</span><span>Size ({coin})</span><span>Time</span></div>
+      <div className="row muted" style={{ paddingTop: 6 }}><span>Price</span><span>Size ({m?.spot?.base ?? coin})</span><span>Time</span></div>
       {trades.map((t, i) => (
         <div key={i} className="row">
-          <span className={t.side === 'B' ? 'up' : 'down'}>{fmtPx(t.px, szD)}</span>
+          <span className={t.side === 'B' ? 'up' : 'down'}>{fmtPx(t.px, szD, sp)}</span>
           <span>{fmtSz(t.sz, szD)}</span>
           <span className="muted">{fmtTime(t.time)}</span>
         </div>

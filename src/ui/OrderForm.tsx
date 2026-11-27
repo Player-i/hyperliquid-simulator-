@@ -1,16 +1,19 @@
 import { useEffect, useState } from 'react';
-import type { Side, Tif } from '../engine/engine';
-import { MIN_ORDER_NOTIONAL, roundPrice, roundSize } from '../engine/rules';
+import { TWAP_INTERVAL_MS, type Side, type Tif } from '../engine/engine';
+import { MIN_ORDER_NOTIONAL, roundSize } from '../engine/rules';
 import { useStore } from '../store';
-import { fmtPx, fmtUsd } from './format';
+import { fmtNum, fmtPx, fmtUsd } from './format';
 import { bookClick } from './OrderBook';
-import { LeverageModal } from './Modals';
+import { LeverageModal, TransferModal } from './Modals';
 
-type OType = 'market' | 'limit' | 'stop-market' | 'stop-limit' | 'tp-market' | 'tp-limit';
+type OType = 'market' | 'limit' | 'stop-market' | 'stop-limit' | 'tp-market' | 'tp-limit' | 'twap';
 
 const TYPE_LABEL: Record<OType, string> = {
-  market: 'Market', limit: 'Limit', 'stop-market': 'Stop Market', 'stop-limit': 'Stop Limit', 'tp-market': 'Take Profit Market', 'tp-limit': 'Take Profit Limit',
+  market: 'Market', limit: 'Limit', 'stop-market': 'Stop Market', 'stop-limit': 'Stop Limit',
+  'tp-market': 'Take Profit Market', 'tp-limit': 'Take Profit Limit', twap: 'TWAP',
 };
+const PERP_PRO: OType[] = ['stop-market', 'stop-limit', 'tp-market', 'tp-limit', 'twap'];
+const SPOT_PRO: OType[] = ['twap'];
 
 export function OrderForm() {
   const s = useStore();
@@ -29,29 +32,60 @@ export function OrderForm() {
   const [tpsl, setTpsl] = useState(false);
   const [tpStr, setTpStr] = useState('');
   const [slStr, setSlStr] = useState('');
+  const [twapH, setTwapH] = useState('0');
+  const [twapM, setTwapM] = useState('30');
+  const [randomize, setRandomize] = useState(false);
   const [levOpen, setLevOpen] = useState(false);
+  const [xferOpen, setXferOpen] = useState(false);
+  const spot = m?.spot;
 
   useEffect(() => { setPxStr(''); setTrigStr(''); setSzStr(''); setPct(0); setTpStr(''); setSlStr(''); }, [coin]);
   useEffect(() => {
-    bookClick.setPrice = (px) => { setPxStr(String(px)); if (type === 'market') setType('limit'); };
+    if (spot) { setReduceOnly(false); setTpsl(false); if (type !== 'market' && type !== 'limit' && type !== 'twap') setType('market'); }
+  }, [spot, type]);
+  useEffect(() => {
+    bookClick.setPrice = (px) => { setPxStr(String(px)); if (type === 'market' || type === 'twap') setType('limit'); };
   }, [type]);
 
   if (!m) return <div className="empty">Loading markets…</div>;
   const szD = m.szDecimals;
+  const sp = !!spot;
   const book = e.books.get(coin);
   const mid = e.midPx(coin);
   const ls = e.levSetting(coin);
-  const pos = e.state.positions[coin];
+  const pos = sp ? undefined : e.state.positions[coin];
   const sum = e.summary();
+  const isTwap = type === 'twap';
   const isTrigger = type.startsWith('stop') || type.startsWith('tp');
   const needsLimitPx = type === 'limit' || type.endsWith('-limit');
   const limitPx = Number(pxStr) || 0;
   const triggerPx = Number(trigStr) || 0;
-  const refPx = needsLimitPx ? limitPx || mid : isTrigger ? triggerPx || mid : side === 'B' ? book?.asks[0]?.px ?? mid : book?.bids[0]?.px ?? mid;
+  const refPx = needsLimitPx ? limitPx || mid : isTrigger ? triggerPx || mid : isTwap ? mid : side === 'B' ? book?.asks[0]?.px ?? mid : book?.bids[0]?.px ?? mid;
+  const baseName = spot?.base ?? coin;
+  const quoteName = spot?.quote ?? 'USD';
+  const takerFee = sp ? e.state.settings.spotTakerFee : e.state.settings.takerFee;
+  const makerFee = sp ? e.state.settings.spotMakerFee : e.state.settings.makerFee;
 
-  // max size: available margin * leverage, plus whatever closes an opposite position
+  // what you can trade right now
+  let available: number; // in quote (buy) or USD margin
+  let availLabel: string;
+  let maxSz: number;
   const opp = pos && Math.sign(pos.szi) === (side === 'B' ? -1 : 1) ? Math.abs(pos.szi) : 0;
-  const maxSz = reduceOnly ? opp : roundSize((sum.available * ls.leverage) / (refPx * (1 + e.state.settings.takerFee * ls.leverage)) + opp, szD);
+  if (sp) {
+    if (side === 'B') {
+      available = e.spotAvailable(spot!.quote);
+      availLabel = `${fmtNum(available, 2)} ${spot!.quote}`;
+      maxSz = refPx ? roundSize(available / refPx, szD) : 0;
+    } else {
+      available = e.spotAvailable(spot!.base);
+      availLabel = `${fmtNum(available, szD)} ${spot!.base}`;
+      maxSz = roundSize(available, szD);
+    }
+  } else {
+    available = sum.available;
+    availLabel = fmtUsd(available);
+    maxSz = reduceOnly ? opp : roundSize((sum.available * ls.leverage) / (refPx * (1 + takerFee * ls.leverage)) + opp, szD);
+  }
 
   const sz = (() => {
     const v = Number(szStr) || 0;
@@ -59,20 +93,27 @@ export function OrderForm() {
   })();
   const notional = sz * refPx;
   const incSz = Math.max(0, sz - opp);
-  const marginReq = (incSz * refPx) / ls.leverage;
-  const est = type === 'market' && sz > 0 ? e.estimateTaker(coin, side, sz) : null;
-  const feeRate = type === 'market' || (type === 'limit' && tif === 'Ioc') ? e.state.settings.takerFee : e.state.settings.makerFee;
+  const marginReq = sp ? 0 : (incSz * refPx) / ls.leverage;
+  const est = (type === 'market' || isTwap) && sz > 0 ? e.estimateTaker(coin, side, isTwap ? sz / twapSlices() : sz) : null;
+  const feeRate = type === 'market' || isTwap || (type === 'limit' && tif === 'Ioc') ? takerFee : makerFee;
 
-  // estimated liquidation price of the resulting position
+  function twapSlices() {
+    const mins = (Number(twapH) || 0) * 60 + (Number(twapM) || 0);
+    return Math.max(1, (mins * 60_000) / TWAP_INTERVAL_MS);
+  }
+  const twapMinutes = (Number(twapH) || 0) * 60 + (Number(twapM) || 0);
+
+  // estimated liquidation price of the resulting perp position
   let estLiq: number | null = null;
-  if (sz > 0 && !reduceOnly && refPx) {
+  if (!sp && sz > 0 && !reduceOnly && refPx) {
     const sign = side === 'B' ? 1 : -1;
     const curSz = pos?.szi ?? 0;
     const newSz = curSz + sign * sz;
     if (Math.abs(newSz) > 1e-12) {
-      const entry = Math.sign(newSz) === Math.sign(curSz) && curSz !== 0 && Math.abs(newSz) > Math.abs(curSz)
-        ? (Math.abs(curSz) * pos!.entryPx + sz * (est?.avgPx ?? refPx)) / Math.abs(newSz)
-        : Math.sign(newSz) === Math.sign(curSz) ? pos!.entryPx : est?.avgPx ?? refPx;
+      const fillPx = est?.avgPx ?? refPx;
+      const entry = curSz !== 0 && Math.sign(newSz) === Math.sign(curSz)
+        ? Math.abs(newSz) > Math.abs(curSz) ? (Math.abs(curSz) * pos!.entryPx + sz * fillPx) / Math.abs(newSz) : pos!.entryPx
+        : fillPx;
       const absSz = Math.abs(newSz), ss = Math.sign(newSz);
       const l = e.mmr(coin, absSz * refPx);
       let av: number;
@@ -94,20 +135,18 @@ export function OrderForm() {
   };
 
   const submit = () => {
-    const base = { coin, side, sz, reduceOnly };
     let r;
-    if (type === 'market') r = e.placeOrder({ ...base, kind: 'market' });
-    else if (type === 'limit') r = e.placeOrder({ ...base, kind: 'limit', px: limitPx, tif });
+    if (isTwap) r = e.placeTwap({ coin, side, sz, minutes: twapMinutes, randomize, reduceOnly });
+    else if (type === 'market') r = e.placeOrder({ coin, side, sz, reduceOnly, kind: 'market' });
+    else if (type === 'limit') r = e.placeOrder({ coin, side, sz, reduceOnly, kind: 'limit', px: limitPx, tif });
     else {
-      // trigger orders: tp/sl relative to the direction of the order
-      const tpslKind = type.startsWith('tp') ? 'tp' : 'sl';
       r = e.placeOrder({
-        ...base, kind: 'trigger', px: needsLimitPx ? limitPx : 0,
-        trigger: { triggerPx, isMarket: !needsLimitPx, tpsl: tpslKind },
+        coin, side, sz, reduceOnly, kind: 'trigger', px: needsLimitPx ? limitPx : 0,
+        trigger: { triggerPx, isMarket: !needsLimitPx, tpsl: type.startsWith('tp') ? 'tp' : 'sl' },
       });
     }
     if (!r.ok) { s.toast('reject', r.error ?? 'Rejected'); return; }
-    if (tpsl && !isTrigger && !reduceOnly) {
+    if (tpsl && !sp && !isTrigger && !isTwap && !reduceOnly) {
       const exit: Side = side === 'B' ? 'A' : 'B';
       const tp = Number(tpStr), sl = Number(slStr);
       if (tp > 0) e.placeOrder({ coin, side: exit, kind: 'trigger', sz, trigger: { triggerPx: tp, isMarket: true, tpsl: 'tp', positionTpsl: true } });
@@ -121,79 +160,108 @@ export function OrderForm() {
   if (sz > 0 && !reduceOnly && notional < MIN_ORDER_NOTIONAL) error = `Minimum order value is $${MIN_ORDER_NOTIONAL}`;
   if (needsLimitPx && !limitPx) error = 'Enter a price';
   if (isTrigger && !triggerPx) error = 'Enter a trigger price';
-  if (!reduceOnly && marginReq > sum.available + 1e-9 && sz > 0) error = 'Insufficient margin';
+  if (isTwap && (twapMinutes < 5 || twapMinutes > 1440)) error = 'Duration must be 5m – 24h';
+  else if (isTwap && sz > 0 && !reduceOnly && notional / twapSlices() < MIN_ORDER_NOTIONAL) error = `Sub-orders must be ≥ $${MIN_ORDER_NOTIONAL}`;
+  if (sp && sz > maxSz + 1e-12) error = `Insufficient ${side === 'B' ? quoteName : baseName}`;
+  if (!sp && !reduceOnly && marginReq > sum.available + 1e-9 && sz > 0) error = 'Insufficient margin';
   if (reduceOnly && !opp) error = 'No position to reduce';
+
+  const proTypes = sp ? SPOT_PRO : PERP_PRO;
+  const isPro = proTypes.includes(type);
+  const buyLabel = sp ? 'Buy' : 'Buy / Long';
+  const sellLabel = sp ? 'Sell' : 'Sell / Short';
 
   return (
     <div className="form">
-      <div className="row2" style={{ display: 'flex', gap: 8 }}>
-        <button className="btn" style={{ flex: 1 }} onClick={() => setLevOpen(true)}>{ls.mode === 'cross' ? 'Cross' : 'Isolated'}</button>
-        <button className="btn" style={{ flex: 1 }} onClick={() => setLevOpen(true)}>{ls.leverage}x</button>
-      </div>
+      {sp ? (
+        <button className="btn" onClick={() => setXferOpen(true)}>Transfer USDC between Perps ⇄ Spot</button>
+      ) : (
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn" style={{ flex: 1 }} onClick={() => setLevOpen(true)}>{ls.mode === 'cross' ? 'Cross' : 'Isolated'}</button>
+          <button className="btn" style={{ flex: 1 }} onClick={() => setLevOpen(true)}>{ls.leverage}x</button>
+        </div>
+      )}
       <div className="seg">
         {(['market', 'limit'] as OType[]).map((t) => (
           <button key={t} className={type === t ? 'active' : ''} onClick={() => setType(t)}>{TYPE_LABEL[t]}</button>
         ))}
         <select
-          className={isTrigger ? 'active' : ''}
-          style={{ background: isTrigger ? 'var(--bg)' : 'none', border: 0, borderRadius: 6, color: isTrigger ? 'var(--text)' : 'var(--muted)', textAlign: 'center' }}
-          value={isTrigger ? type : ''}
+          aria-label="Pro order types"
+          style={{ background: isPro ? 'var(--bg)' : 'none', border: 0, borderRadius: 6, color: isPro ? 'var(--text)' : 'var(--muted)', textAlign: 'center' }}
+          value={isPro ? type : ''}
           onChange={(ev) => setType(ev.target.value as OType)}
         >
           <option value="" disabled>Pro</option>
-          {(['stop-market', 'stop-limit', 'tp-market', 'tp-limit'] as OType[]).map((t) => <option key={t} value={t}>{TYPE_LABEL[t]}</option>)}
+          {proTypes.map((t) => <option key={t} value={t}>{TYPE_LABEL[t]}</option>)}
         </select>
       </div>
       <div className="seg">
-        <button className={`buy ${side === 'B' ? 'active' : ''}`} onClick={() => setSide('B')}>Buy / Long</button>
-        <button className={`sell ${side === 'A' ? 'active' : ''}`} onClick={() => setSide('A')}>Sell / Short</button>
+        <button className={`buy ${side === 'B' ? 'active' : ''}`} onClick={() => setSide('B')}>{buyLabel}</button>
+        <button className={`sell ${side === 'A' ? 'active' : ''}`} onClick={() => setSide('A')}>{sellLabel}</button>
       </div>
 
-      <div className="kv"><span>Available to Trade</span><span className="v num">{fmtUsd(sum.available)}</span></div>
-      <div className="kv"><span>Current Position</span><span className={`v num ${pos ? (pos.szi > 0 ? 'up' : 'down') : ''}`}>{pos ? `${pos.szi.toFixed(szD)} ${coin}` : `0 ${coin}`}</span></div>
+      <div className="kv"><span>Available to Trade</span><span className="v num">{availLabel}</span></div>
+      {sp ? (
+        <div className="kv"><span>{side === 'B' ? `${baseName} balance` : `${quoteName} balance`}</span><span className="v num">{fmtNum(e.state.spot[side === 'B' ? baseName : quoteName] ?? 0, side === 'B' ? szD : 2)}</span></div>
+      ) : (
+        <div className="kv"><span>Current Position</span><span className={`v num ${pos ? (pos.szi > 0 ? 'up' : 'down') : ''}`}>{pos ? `${pos.szi.toFixed(szD)} ${coin}` : `0 ${coin}`}</span></div>
+      )}
+      {sp && side === 'B' && !(e.state.spot[quoteName] > 0) && (
+        <div className="muted">Your spot account has no {quoteName}. {quoteName === 'USDC' ? 'Transfer USDC from Perps to start trading spot.' : `Buy ${quoteName} on its USDC market first.`}</div>
+      )}
 
       {isTrigger && (
         <div className="field">
           <label>Trigger Price</label>
-          <input inputMode="decimal" value={trigStr} onChange={(ev) => setTrigStr(ev.target.value)} placeholder={fmtPx(e.markPx(coin), szD)} />
+          <input inputMode="decimal" value={trigStr} onChange={(ev) => setTrigStr(ev.target.value)} placeholder={fmtPx(e.markPx(coin), szD, sp)} />
           <span className="unit">USD</span>
         </div>
       )}
       {needsLimitPx && (
         <div className="field">
           <label>Price</label>
-          <input inputMode="decimal" value={pxStr} onChange={(ev) => setPxStr(ev.target.value)} onBlur={() => limitPx && setPxStr(String(roundPrice(limitPx, szD)))} />
-          <button className="btn small" onClick={() => setPxStr(String(roundPrice(mid, szD)))}>Mid</button>
+          <input inputMode="decimal" value={pxStr} onChange={(ev) => setPxStr(ev.target.value)} onBlur={() => limitPx && setPxStr(String(e.roundPx(coin, limitPx)))} />
+          <button className="btn small" onClick={() => setPxStr(String(e.roundPx(coin, mid)))}>Mid</button>
         </div>
       )}
       <div className="field">
         <label>Size</label>
         <input inputMode="decimal" value={szStr} onChange={(ev) => { setSzStr(ev.target.value); setPct(0); }} placeholder="0" />
-        <select value={unit} onChange={(ev) => { setUnit(ev.target.value as 'coin' | 'usd'); setSzStr(''); setPct(0); }}>
-          <option value="usd">USD</option>
-          <option value="coin">{coin}</option>
+        <select aria-label="Size unit" value={unit} onChange={(ev) => { setUnit(ev.target.value as 'coin' | 'usd'); setSzStr(''); setPct(0); }}>
+          <option value="usd">{quoteName}</option>
+          <option value="coin">{baseName}</option>
         </select>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <input className="slider" type="range" min={0} max={100} value={pct} onChange={(ev) => setFromPct(Number(ev.target.value))} />
+        <input className="slider" type="range" min={0} max={100} value={pct} onChange={(ev) => setFromPct(Number(ev.target.value))} aria-label="Size percent" />
         <span className="num muted" style={{ width: 36, textAlign: 'right' }}>{pct}%</span>
       </div>
-      {unit === 'usd' && sz > 0 && <div className="kv"><span>Size in {coin}</span><span className="v num">{sz.toFixed(szD)}</span></div>}
+      {unit === 'usd' && sz > 0 && <div className="kv"><span>Size in {baseName}</span><span className="v num">{sz.toFixed(szD)}</span></div>}
+
+      {isTwap && (
+        <>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <div className="field" style={{ flex: 1 }}><label>Hours</label><input inputMode="numeric" value={twapH} onChange={(ev) => setTwapH(ev.target.value)} /></div>
+            <div className="field" style={{ flex: 1 }}><label>Minutes</label><input inputMode="numeric" value={twapM} onChange={(ev) => setTwapM(ev.target.value)} /></div>
+          </div>
+          <label className="check"><input type="checkbox" checked={randomize} onChange={(ev) => setRandomize(ev.target.checked)} /> Randomize sub-order sizes</label>
+        </>
+      )}
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <label className="check"><input type="checkbox" checked={reduceOnly} onChange={(ev) => setReduceOnly(ev.target.checked)} /> Reduce Only</label>
+        {!sp ? <label className="check"><input type="checkbox" checked={reduceOnly} onChange={(ev) => setReduceOnly(ev.target.checked)} /> Reduce Only</label> : <span />}
         {type === 'limit' && (
-          <select className="btn small" value={tif} onChange={(ev) => setTif(ev.target.value as Tif)}>
+          <select className="btn small" value={tif} onChange={(ev) => setTif(ev.target.value as Tif)} aria-label="Time in force">
             <option value="Gtc">GTC</option>
             <option value="Alo">ALO (Post only)</option>
             <option value="Ioc">IOC</option>
           </select>
         )}
       </div>
-      {!isTrigger && !reduceOnly && (
+      {!sp && !isTrigger && !isTwap && !reduceOnly && (
         <label className="check"><input type="checkbox" checked={tpsl} onChange={(ev) => setTpsl(ev.target.checked)} /> Take Profit / Stop Loss</label>
       )}
-      {tpsl && !isTrigger && !reduceOnly && (
+      {tpsl && !sp && !isTrigger && !isTwap && !reduceOnly && (
         <div style={{ display: 'flex', gap: 8 }}>
           <div className="field" style={{ flex: 1 }}><label>TP</label><input inputMode="decimal" value={tpStr} onChange={(ev) => setTpStr(ev.target.value)} /></div>
           <div className="field" style={{ flex: 1 }}><label>SL</label><input inputMode="decimal" value={slStr} onChange={(ev) => setSlStr(ev.target.value)} /></div>
@@ -201,36 +269,47 @@ export function OrderForm() {
       )}
 
       <button className={`submit ${side === 'B' ? 'buy' : 'sell'}`} disabled={!sz || !!error} onClick={submit}>
-        {error && sz ? error : `${side === 'B' ? 'Buy / Long' : 'Sell / Short'}${type !== 'market' ? ` (${TYPE_LABEL[type]})` : ''}`}
+        {error && sz ? error : `${side === 'B' ? buyLabel : sellLabel}${type !== 'market' ? ` (${TYPE_LABEL[type]})` : ''}`}
       </button>
 
-      <div className="kv"><span>Liquidation Price</span><span className="v num warn">{estLiq ? fmtPx(estLiq, szD) : 'N/A'}</span></div>
+      {!sp && !isTwap && <div className="kv"><span>Liquidation Price</span><span className="v num warn">{estLiq ? fmtPx(estLiq, szD) : 'N/A'}</span></div>}
       <div className="kv"><span>Order Value</span><span className="v num">{sz ? fmtUsd(notional) : 'N/A'}</span></div>
-      <div className="kv"><span>Margin Required</span><span className="v num">{sz ? fmtUsd(marginReq) : 'N/A'}</span></div>
-      {type === 'market' && (
-        <div className="kv"><span>Est. Slippage</span><span className="v num">{est ? `${(est.slippage * 100).toFixed(4)}%${est.filled < sz ? ' (book too thin!)' : ''}` : 'N/A'}</span></div>
+      {!sp && <div className="kv"><span>Margin Required</span><span className="v num">{sz ? fmtUsd(marginReq) : 'N/A'}</span></div>}
+      {isTwap && (
+        <>
+          <div className="kv"><span>Sub-orders</span><span className="v num">{twapSlices()} × every 30s</span></div>
+          <div className="kv"><span>Size per sub-order</span><span className="v num">{sz ? `${(sz / twapSlices()).toFixed(szD)} ${baseName} (${fmtUsd(notional / twapSlices())})` : 'N/A'}</span></div>
+          <div className="kv"><span>Max slippage per sub-order</span><span className="v num">3%</span></div>
+        </>
       )}
-      {type === 'market' && est && <div className="kv"><span>Est. Avg Fill</span><span className="v num">{fmtPx(est.avgPx, szD)}</span></div>}
-      <div className="kv"><span>Fees</span><span className="v num">{(e.state.settings.takerFee * 100).toFixed(4)}% / {(e.state.settings.makerFee * 100).toFixed(4)}%</span></div>
+      {(type === 'market' || isTwap) && (
+        <div className="kv"><span>{isTwap ? 'Est. Slippage per sub-order' : 'Est. Slippage'}</span><span className="v num">{est ? `${(est.slippage * 100).toFixed(4)}%${est.filled < (isTwap ? sz / twapSlices() : sz) ? ' (book too thin!)' : ''}` : 'N/A'}</span></div>
+      )}
+      {type === 'market' && est && <div className="kv"><span>Est. Avg Fill</span><span className="v num">{fmtPx(est.avgPx, szD, sp)}</span></div>}
+      <div className="kv"><span>Fees (taker / maker)</span><span className="v num">{(takerFee * 100).toFixed(4)}% / {(makerFee * 100).toFixed(4)}%</span></div>
 
       <div className="divider" />
-      <Account />
+      <Account onTransfer={() => setXferOpen(true)} />
       {levOpen && <LeverageModal coin={coin} onClose={() => setLevOpen(false)} />}
+      {xferOpen && <TransferModal onClose={() => setXferOpen(false)} />}
     </div>
   );
 }
 
-function Account() {
+function Account({ onTransfer }: { onTransfer: () => void }) {
   const s = useStore();
   const sum = s.engine.summary();
   return (
     <div className="acct" style={{ padding: 0 }}>
       <div className="sectiontitle">Account Equity</div>
-      <div className="kv"><span>Equity</span><span className="v num">{fmtUsd(sum.equity)}</span></div>
-      <div className="kv"><span>Balance (USDC)</span><span className="v num">{fmtUsd(sum.cash)}</span></div>
-      <div className="kv"><span>Unrealized PnL</span><span className={`v num ${sum.upnl >= 0 ? 'up' : 'down'}`}>{fmtUsd(sum.upnl)}</span></div>
+      <div className="kv"><span>Total Equity</span><span className="v num">{fmtUsd(sum.equity)}</span></div>
+      <div className="kv"><span>Perps Equity</span><span className="v num">{fmtUsd(sum.perpEquity)}</span></div>
+      <div className="kv"><span>Spot Value</span><span className="v num">{fmtUsd(sum.spotValue)}</span></div>
+      <div className="kv"><span>Unrealized PnL (perps)</span><span className={`v num ${sum.upnl >= 0 ? 'up' : 'down'}`}>{fmtUsd(sum.upnl)}</span></div>
       <div className="kv"><span>PnL Since Start</span><span className={`v num ${sum.pnlSinceStart >= 0 ? 'up' : 'down'}`}>{fmtUsd(sum.pnlSinceStart)}</span></div>
+      <button className="btn small" onClick={onTransfer}>Transfer Perps ⇄ Spot</button>
       <div className="sectiontitle">Perps Overview</div>
+      <div className="kv"><span>Balance (USDC)</span><span className="v num">{fmtUsd(sum.cash)}</span></div>
       <div className="kv"><span>Cross Margin Ratio</span><span className={`v num ${sum.crossMarginRatio > 0.7 ? 'down' : ''}`}>{(sum.crossMarginRatio * 100).toFixed(2)}%</span></div>
       <div className="kv"><span>Maintenance Margin</span><span className="v num">{fmtUsd(sum.crossMaint)}</span></div>
       <div className="kv"><span>Cross Account Leverage</span><span className="v num">{sum.accountLeverage.toFixed(2)}x</span></div>

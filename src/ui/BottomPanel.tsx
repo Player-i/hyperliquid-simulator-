@@ -1,10 +1,10 @@
 import { useState } from 'react';
 import type { Order } from '../engine/engine';
 import { useStore } from '../store';
-import { fmtDateTime, fmtPx, fmtSigned, fmtSz, fmtUsd, pnlClass } from './format';
+import { fmtDateTime, fmtNum, fmtPx, fmtSigned, fmtSz, fmtUsd, pnlClass } from './format';
 import { LimitCloseModal, MarginModal, TpslModal } from './Modals';
 
-type Tab = 'positions' | 'orders' | 'trades' | 'funding' | 'history';
+type Tab = 'balances' | 'positions' | 'orders' | 'twap' | 'trades' | 'funding' | 'history';
 
 export function BottomPanel() {
   const s = useStore();
@@ -12,8 +12,10 @@ export function BottomPanel() {
   const [tab, setTab] = useState<Tab>('positions');
   const [onlyCurrent, setOnlyCurrent] = useState(false);
   const tabs: [Tab, string][] = [
+    ['balances', 'Balances'],
     ['positions', `Positions (${Object.keys(st.positions).length})`],
     ['orders', `Open Orders (${st.orders.filter((o) => o.status === 'open' || o.status === 'pending').length})`],
+    ['twap', `TWAP (${st.twaps.filter((t) => t.status === 'running').length})`],
     ['trades', 'Trade History'],
     ['funding', 'Funding History'],
     ['history', 'Order History'],
@@ -23,10 +25,12 @@ export function BottomPanel() {
       <div className="tabs">
         {tabs.map(([k, l]) => <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{l}</button>)}
         <div className="right">
-          <label className="check"><input type="checkbox" checked={onlyCurrent} onChange={(e) => setOnlyCurrent(e.target.checked)} /> {s.prefs.coin} only</label>
+          <label className="check"><input type="checkbox" checked={onlyCurrent} onChange={(e) => setOnlyCurrent(e.target.checked)} /> {s.display(s.prefs.coin)} only</label>
         </div>
       </div>
       <div className="tablewrap">
+        {tab === 'balances' && <Balances />}
+        {tab === 'twap' && <Twaps filter={onlyCurrent ? s.prefs.coin : null} />}
         {tab === 'positions' && <Positions filter={onlyCurrent ? s.prefs.coin : null} />}
         {tab === 'orders' && <OpenOrders filter={onlyCurrent ? s.prefs.coin : null} />}
         {tab === 'trades' && <Fills filter={onlyCurrent ? s.prefs.coin : null} />}
@@ -119,12 +123,12 @@ function OpenOrders({ filter }: { filter: string | null }) {
             <tr key={o.oid}>
               <td>{fmtDateTime(o.createdAt)}</td>
               <td>{orderType(o)}{o.status === 'pending' && <span className="faint"> (sending…)</span>}</td>
-              <td>{o.coin}</td>
-              <td className={o.side === 'B' ? 'up' : 'down'}>{o.side === 'B' ? (o.reduceOnly ? 'Close Short' : 'Long') : (o.reduceOnly ? 'Close Long' : 'Short')}</td>
+              <td>{s.display(o.coin)}</td>
+              <td className={o.side === 'B' ? 'up' : 'down'}>{a.spot ? (o.side === 'B' ? 'Buy' : 'Sell') : o.side === 'B' ? (o.reduceOnly ? 'Close Short' : 'Long') : (o.reduceOnly ? 'Close Long' : 'Short')}</td>
               <td>{o.trigger?.positionTpsl ? 'Position' : fmtSz(o.sz, a.szDecimals)}</td>
               <td>{o.trigger?.positionTpsl ? '--' : fmtSz(o.origSz, a.szDecimals)}</td>
-              <td>{o.kind === 'market' || o.trigger?.isMarket ? 'Market' : fmtPx(o.px, a.szDecimals)}</td>
-              <td>{o.trigger ? `${o.side === 'A' ? (o.trigger.tpsl === 'sl' ? '≤' : '≥') : (o.trigger.tpsl === 'sl' ? '≥' : '≤')} ${fmtPx(o.trigger.triggerPx, a.szDecimals)}` : 'N/A'}</td>
+              <td>{o.kind === 'market' || o.trigger?.isMarket ? 'Market' : fmtPx(o.px, a.szDecimals, !!a.spot)}</td>
+              <td>{o.trigger ? `${o.side === 'A' ? (o.trigger.tpsl === 'sl' ? '≤' : '≥') : (o.trigger.tpsl === 'sl' ? '≥' : '≤')} ${fmtPx(o.trigger.triggerPx, a.szDecimals, !!a.spot)}` : 'N/A'}</td>
               <td title="Simulated size resting ahead of you at this price">{o.kind === 'limit' && o.status === 'open' ? (Number.isFinite(o.queueAhead) ? fmtSz(o.queueAhead, a.szDecimals) : 'beyond visible book') : '--'}</td>
               <td>{o.reduceOnly ? 'Yes' : 'No'}</td>
               <td><button className="btn small" onClick={() => e.cancelOrder(o.oid)}>Cancel</button></td>
@@ -150,9 +154,9 @@ function Fills({ filter }: { filter: string | null }) {
           return (
             <tr key={f.id}>
               <td>{fmtDateTime(f.time)}</td>
-              <td>{f.coin}</td>
+              <td>{f.label ?? f.coin}{f.twapId ? <span className="faint"> TWAP</span> : null}</td>
               <td className={f.side === 'B' ? 'up' : 'down'}>{f.liquidation ? 'Liquidation: ' : ''}{f.dir}</td>
-              <td>{fmtPx(f.px, a?.szDecimals ?? 2)}</td>
+              <td>{fmtPx(f.px, a?.szDecimals ?? 2, !!f.spot)}</td>
               <td>{fmtSz(f.sz, a?.szDecimals ?? 4)}</td>
               <td>{fmtUsd(f.px * f.sz)}</td>
               <td>{fmtUsd(f.fee, 4)}</td>
@@ -205,12 +209,89 @@ function History({ filter }: { filter: string | null }) {
             <tr key={i}>
               <td>{fmtDateTime(h.time)}</td>
               <td>{orderType(o)}</td>
-              <td>{o.coin}</td>
+              <td>{s.display(o.coin)}</td>
               <td className={o.side === 'B' ? 'up' : 'down'}>{o.side === 'B' ? 'Buy' : 'Sell'}</td>
               <td>{o.trigger?.positionTpsl ? 'Position' : fmtSz(o.origSz, a?.szDecimals ?? 4)}</td>
               <td>{fmtSz(o.origSz - o.sz, a?.szDecimals ?? 4)}</td>
-              <td>{o.kind === 'market' ? 'Market' : fmtPx(o.px || o.trigger?.triggerPx, a?.szDecimals ?? 2)}</td>
+              <td>{o.kind === 'market' ? 'Market' : fmtPx(o.px || o.trigger?.triggerPx, a?.szDecimals ?? 2, !!a?.spot)}</td>
               <td className={o.status === 'rejected' ? 'warn' : 'muted'}>{o.status}{o.statusMsg && o.statusMsg.toLowerCase() !== o.status ? ` — ${o.statusMsg}` : ''}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+function Balances() {
+  const s = useStore();
+  const e = s.engine;
+  const sum = e.summary();
+  const tokens = Object.entries(e.state.spot).sort((a, b) => b[1] * e.tokenPx(b[0]) - a[1] * e.tokenPx(a[0]));
+  const pairFor = (token: string) => s.markets.find((m) => m.spot?.base === token && m.spot.quote === 'USDC');
+  return (
+    <table className="table">
+      <thead><tr><th>Coin</th><th>Total Balance</th><th>Available Balance</th><th>USDC Value</th><th>Avg Cost</th><th>PnL (ROE %)</th><th></th></tr></thead>
+      <tbody>
+        <tr>
+          <td>USDC <span className="faint">(Perps)</span></td>
+          <td>{fmtNum(sum.perpEquity, 2)} USDC</td>
+          <td>{fmtNum(sum.available, 2)} USDC</td>
+          <td>{fmtUsd(sum.perpEquity)}</td>
+          <td>--</td><td>--</td><td />
+        </tr>
+        {tokens.map(([t, amt]) => {
+          const px = e.tokenPx(t);
+          const cb = e.state.spotCost[t];
+          const avg = cb && cb.sz > 0 ? cb.cost / cb.sz : 0;
+          const pnl = avg ? (px - avg) * amt : 0;
+          const pair = pairFor(t);
+          return (
+            <tr key={t}>
+              <td>{t} <span className="faint">(Spot)</span></td>
+              <td>{fmtNum(amt, 8)} {t}</td>
+              <td>{fmtNum(e.spotAvailable(t), 8)} {t}</td>
+              <td>{px ? fmtUsd(amt * px) : '—'}</td>
+              <td>{avg ? fmtPx(avg, pair?.szDecimals ?? 2, true) : '--'}</td>
+              <td className={pnlClass(pnl)}>{avg ? `${fmtSigned(pnl)} (${((px / avg - 1) * 100).toFixed(1)}%)` : '--'}</td>
+              <td>{pair && <button className="btn small" onClick={() => s.setCoin(pair.coin)}>Trade</button>}</td>
+            </tr>
+          );
+        })}
+        {!tokens.length && <tr><td colSpan={7} className="muted">No spot balances. Use “Transfer Perps ⇄ Spot” to fund your spot account.</td></tr>}
+      </tbody>
+    </table>
+  );
+}
+
+function Twaps({ filter }: { filter: string | null }) {
+  const s = useStore();
+  const e = s.engine;
+  const ts = e.state.twaps.filter((t) => !filter || t.coin === filter).slice(0, 200);
+  if (!ts.length) return <div className="empty">No TWAP orders. Pick “TWAP” under Pro in the order form.</div>;
+  return (
+    <table className="table">
+      <thead><tr><th>Started</th><th>Coin</th><th>Side</th><th>Size</th><th>Executed</th><th>Avg Price</th><th>Running Time / Total</th><th>Reduce Only</th><th>Randomize</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        {ts.map((t) => {
+          const a = e.assets.get(t.coin);
+          const szD = a?.szDecimals ?? 4;
+          const end = t.endedAt ?? Date.now();
+          const ran = Math.min(t.durationMs, end - t.startedAt);
+          const mins = (ms: number) => `${Math.floor(ms / 60_000)}m ${String(Math.floor((ms % 60_000) / 1000)).padStart(2, '0')}s`;
+          return (
+            <tr key={t.id}>
+              <td>{fmtDateTime(t.startedAt)}</td>
+              <td>{s.display(t.coin)}</td>
+              <td className={t.side === 'B' ? 'up' : 'down'}>{t.side === 'B' ? 'Buy' : 'Sell'}</td>
+              <td>{fmtSz(t.totalSz, szD)}</td>
+              <td>{fmtSz(t.filledSz, szD)} ({((t.filledSz / t.totalSz) * 100).toFixed(0)}%)</td>
+              <td>{t.filledSz ? fmtPx(t.notional / t.filledSz, szD, !!a?.spot) : '--'}</td>
+              <td>{mins(ran)} / {mins(t.durationMs)}</td>
+              <td>{t.reduceOnly ? 'Yes' : 'No'}</td>
+              <td>{t.randomize ? 'Yes' : 'No'}</td>
+              <td className={t.status === 'running' ? 'up' : 'muted'}>{t.status}{t.lastMsg ? <span className="warn"> — {t.lastMsg}</span> : null}</td>
+              <td>{t.status === 'running' && <button className="btn small" onClick={() => e.cancelTwap(t.id)}>Cancel</button>}</td>
             </tr>
           );
         })}

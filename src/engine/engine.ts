@@ -18,8 +18,13 @@
 //    oracle price (longs pay shorts when positive).
 //  - TP/SL triggers on mark price, like Hyperliquid.
 //  - Optional network latency before an order reaches the "exchange".
+//  - Spot: real token balances, fees taken in the received token, average-cost PnL.
+//  - TWAP: a market sub-order every 30s with max 3% slippage, catching up on
+//    unfilled size (capped at 3x a normal slice), like Hyperliquid's TWAP.
 
 import { MIN_ORDER_NOTIONAL, roundPrice, roundSize } from './rules';
+
+const fmtMin = (v: number) => Math.ceil(v).toLocaleString('en-US');
 
 export type Side = 'B' | 'A'; // B = buy/bid, A = sell/ask (Hyperliquid convention)
 export type Tif = 'Gtc' | 'Alo' | 'Ioc';
@@ -32,6 +37,8 @@ export interface AssetInfo {
   maxLeverage: number;
   tiers: MarginTier[];
   onlyIsolated?: boolean;
+  /** present for spot pairs. `coin` is the exchange's pair id (e.g. "@107" or "PURR/USDC") */
+  spot?: { name: string; base: string; quote: string };
 }
 export interface Level { px: number; sz: number; n: number }
 export interface Book { coin: string; time: number; bids: Level[]; asks: Level[] }
@@ -44,6 +51,8 @@ export interface Settings {
   latencyMs: number;
   marketSlippage: number; // max slippage for market orders, e.g. 0.08
   startingBalance: number;
+  spotTakerFee: number;
+  spotMakerFee: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -52,7 +61,12 @@ export const DEFAULT_SETTINGS: Settings = {
   latencyMs: 150,
   marketSlippage: 0.08,
   startingBalance: 10_000,
+  spotTakerFee: 0.0007,
+  spotMakerFee: 0.0004,
 };
+
+export const TWAP_INTERVAL_MS = 30_000;
+export const TWAP_SLIPPAGE = 0.03;
 
 export type OrderKind = 'limit' | 'market' | 'trigger';
 export type OrderStatus = 'pending' | 'open' | 'filled' | 'canceled' | 'rejected' | 'triggered';
@@ -85,6 +99,27 @@ export interface Order {
   /** exchange time of the book snapshot we joined the queue on; older trades are already reflected */
   restTime?: number;
   statusMsg?: string;
+  /** sub-order of a TWAP */
+  twapId?: number;
+  /** internal order: no toasts / order-history rows */
+  quiet?: boolean;
+}
+
+export interface Twap {
+  id: number;
+  coin: string;
+  side: Side;
+  totalSz: number;
+  filledSz: number;
+  notional: number; // sum px*sz of fills, for avg price
+  startedAt: number;
+  durationMs: number;
+  randomize: boolean;
+  reduceOnly: boolean;
+  status: 'running' | 'completed' | 'canceled';
+  nextAt: number;
+  endedAt?: number;
+  lastMsg?: string;
 }
 
 export interface Position {
@@ -111,6 +146,10 @@ export interface Fill {
   dir: string;
   liquidity: 'maker' | 'taker';
   liquidation?: boolean;
+  spot?: boolean;
+  twapId?: number;
+  /** display name at fill time, e.g. "HYPE/USDC" */
+  label?: string;
 }
 
 export interface FundingEvent { time: number; coin: string; szi: number; rate: number; payment: number }
@@ -130,6 +169,13 @@ export interface State {
   lastFundingHour: number;
   settings: Settings;
   createdAt: number;
+  /** spot token balances (token name -> amount) */
+  spot: Record<string, number>;
+  /** average-cost basis of spot holdings, in quote units */
+  spotCost: Record<string, { sz: number; cost: number }>;
+  twaps: Twap[];
+  /** [time, total equity] samples for the equity curve */
+  equityHist: [number, number][];
 }
 
 export interface OrderRequest {
@@ -158,7 +204,21 @@ export function newState(settings: Settings = DEFAULT_SETTINGS, now = Date.now()
     lastFundingHour: Math.floor(now / 3_600_000),
     settings: { ...settings },
     createdAt: now,
+    spot: {},
+    spotCost: {},
+    twaps: [],
+    equityHist: [[now, settings.startingBalance]],
   };
+}
+
+/** fill in fields added in later versions so old saved accounts keep working */
+export function migrateState(s: State): State {
+  s.settings = { ...DEFAULT_SETTINGS, ...s.settings };
+  s.spot ??= {};
+  s.spotCost ??= {};
+  s.twaps ??= [];
+  s.equityHist ??= [[s.createdAt ?? Date.now(), s.settings.startingBalance]];
+  return s;
 }
 
 const sideSign = (s: Side) => (s === 'B' ? 1 : -1);
@@ -180,7 +240,7 @@ export class Engine {
   onEvent: (e: { type: 'fill' | 'reject' | 'liquidation' | 'info'; msg: string }) => void = () => {};
 
   constructor(state?: State) {
-    this.state = state ?? newState();
+    this.state = state ? migrateState(state) : newState();
   }
 
   // ------------------------------------------------------------------ plumbing
@@ -199,6 +259,16 @@ export class Engine {
     const a = this.assets.get(coin);
     if (!a) throw new Error(`unknown asset ${coin}`);
     return a;
+  }
+
+  isSpot(coin: string) { return !!this.assets.get(coin)?.spot; }
+
+  /** "BTC" for perps, "HYPE/USDC" for spot */
+  label(coin: string) { return this.assets.get(coin)?.spot?.name ?? coin; }
+
+  roundPx(coin: string, px: number, mode: 'nearest' | 'down' | 'up' = 'nearest') {
+    const a = this.asset(coin);
+    return roundPrice(px, a.szDecimals, mode, !!a.spot);
   }
 
   levSetting(coin: string): LevSetting {
@@ -236,6 +306,56 @@ export class Engine {
     return this.markPx(coin);
   }
 
+  // ------------------------------------------------------------- spot math
+  private usdcPairs = new Map<string, string>();
+  /** USDC value of one unit of a spot token */
+  tokenPx(token: string): number {
+    if (token === 'USDC') return 1;
+    let coin = this.usdcPairs.get(token);
+    if (!coin) {
+      for (const a of this.assets.values()) if (a.spot?.base === token && a.spot.quote === 'USDC') { coin = a.coin; break; }
+      if (coin) this.usdcPairs.set(token, coin);
+    }
+    return coin ? this.midPx(coin) : 0;
+  }
+
+  /** balance held by resting spot orders */
+  spotHold(token: string): number {
+    let h = 0;
+    for (const o of this.state.orders) {
+      if (o.status !== 'open' || o.kind !== 'limit') continue;
+      const sp = this.assets.get(o.coin)?.spot;
+      if (!sp) continue;
+      if (o.side === 'B' && sp.quote === token) h += o.sz * o.px;
+      if (o.side === 'A' && sp.base === token) h += o.sz;
+    }
+    return h;
+  }
+
+  spotAvailable(token: string) { return Math.max(0, (this.state.spot[token] ?? 0) - this.spotHold(token)); }
+
+  spotValue() {
+    let v = 0;
+    for (const [t, amt] of Object.entries(this.state.spot)) v += amt * this.tokenPx(t);
+    return v;
+  }
+
+  /** move USDC between the perps and spot accounts */
+  transfer(amount: number, toSpot: boolean): string | null {
+    if (!(amount > 0)) return 'Enter an amount';
+    if (toSpot) {
+      if (amount > this.summary().available + 1e-9) return 'Amount exceeds perps withdrawable balance';
+      this.state.cash -= amount;
+      this.state.spot.USDC = (this.state.spot.USDC ?? 0) + amount;
+    } else {
+      if (amount > this.spotAvailable('USDC') + 1e-9) return 'Amount exceeds available spot USDC';
+      this.state.spot.USDC -= amount;
+      this.state.cash += amount;
+    }
+    this.changed();
+    return null;
+  }
+
   // ------------------------------------------------------------- account math
   upnl(p: Position) { return p.szi * (this.markPx(p.coin) - p.entryPx); }
 
@@ -253,7 +373,7 @@ export class Engine {
   orderMargin(filter?: (o: Order) => boolean): number {
     let total = 0;
     for (const o of this.state.orders) {
-      if (o.status !== 'open' || o.reduceOnly || o.kind === 'trigger') continue;
+      if (o.status !== 'open' || o.reduceOnly || o.kind === 'trigger' || this.isSpot(o.coin)) continue;
       if (filter && !filter(o)) continue;
       const pos = this.state.positions[o.coin];
       let incSz = o.sz;
@@ -282,10 +402,14 @@ export class Engine {
     const crossAccountValue = s.cash + crossUpnl;
     const orderMargin = this.orderMargin();
     const available = Math.max(0, crossAccountValue - crossMargin - orderMargin);
-    const equity = crossAccountValue + isoEquity;
+    const perpEquity = crossAccountValue + isoEquity;
+    const spotValue = this.spotValue();
+    const equity = perpEquity + spotValue;
     return {
       cash: s.cash,
       equity,
+      perpEquity,
+      spotValue,
       crossAccountValue,
       crossMargin,
       crossMaint,
@@ -294,7 +418,7 @@ export class Engine {
       upnl: upnlAll,
       totalNotional: ntl,
       crossMarginRatio: crossAccountValue > 0 ? crossMaint / crossAccountValue : 0,
-      accountLeverage: equity > 0 ? ntl / equity : 0,
+      accountLeverage: perpEquity > 0 ? ntl / perpEquity : 0,
       pnlSinceStart: equity - s.settings.startingBalance,
     };
   }
@@ -400,6 +524,7 @@ export class Engine {
       this.pending = this.pending.filter((p) => p.at > now);
       for (const p of due) p.run();
     }
+    for (const t of this.state.twaps) if (t.status === 'running' && now >= t.nextAt) this.stepTwap(t, now);
     const hour = Math.floor(now / 3_600_000);
     if (hour > this.state.lastFundingHour) {
       this.settleFunding(hour * 3_600_000);
@@ -427,10 +552,11 @@ export class Engine {
     if (req.kind === 'limit' && !(req.px && req.px > 0)) return { ok: false, error: 'Limit price required' };
     if (req.kind === 'trigger' && !req.trigger) return { ok: false, error: 'Trigger price required' };
 
+    if (a.spot && (req.reduceOnly || req.trigger?.positionTpsl)) return { ok: false, error: 'Reduce only is not available for spot' };
     const ref = this.markPx(req.coin) || this.midPx(req.coin);
-    let px = req.px ? roundPrice(req.px, a.szDecimals) : 0;
+    const px = req.px ? this.roundPx(req.coin, req.px) : 0;
     if (req.kind === 'trigger' && req.trigger) {
-      req.trigger.triggerPx = roundPrice(req.trigger.triggerPx, a.szDecimals);
+      req.trigger.triggerPx = this.roundPx(req.coin, req.trigger.triggerPx);
       if (!req.trigger.isMarket && !px) return { ok: false, error: 'Limit price required' };
     }
     const pxForCheck = px || req.trigger?.triggerPx || ref;
@@ -476,7 +602,11 @@ export class Engine {
     if (o.status !== 'pending') return;
     const reject = (msg: string) => {
       this.finish(o, 'rejected', msg, now);
-      this.onEvent({ type: 'reject', msg: `${o.coin}: ${msg}` });
+      if (o.twapId) {
+        const t = this.state.twaps.find((x) => x.id === o.twapId);
+        if (t) t.lastMsg = msg;
+      }
+      if (!o.quiet) this.onEvent({ type: 'reject', msg: `${this.label(o.coin)}: ${msg}` });
       this.cleanup();
       this.changed();
     };
@@ -495,9 +625,9 @@ export class Engine {
     if (o.kind === 'market') {
       const mid = this.midPx(o.coin);
       const slip = this.state.settings.marketSlippage;
-      o.px = roundPrice(mid * (1 + sideSign(o.side) * slip), this.asset(o.coin).szDecimals, o.side === 'B' ? 'up' : 'down');
+      o.px = this.roundPx(o.coin, mid * (1 + sideSign(o.side) * slip), o.side === 'B' ? 'up' : 'down');
     }
-    const err = this.marginCheck(o);
+    const err = this.isSpot(o.coin) ? this.spotBalanceCheck(o) : this.marginCheck(o);
     if (err) return reject(err);
 
     const book = this.books.get(o.coin);
@@ -526,6 +656,20 @@ export class Engine {
     o.status = 'open';
     this.state.history.push({ time: now, order: { ...o } });
     this.changed();
+  }
+
+  private spotBalanceCheck(o: Order): string | null {
+    const sp = this.asset(o.coin).spot!;
+    if (o.side === 'B') {
+      const px = o.kind === 'market' || o.tif === 'Ioc' ? Math.min(o.px, this.estimateTaker(o.coin, 'B', o.sz)?.avgPx ?? o.px) : o.px;
+      const need = o.sz * px;
+      const avail = this.spotAvailable(sp.quote);
+      if (need > avail * 1.0001 + 1e-9) return `Insufficient ${sp.quote} balance (need ${need.toFixed(2)}, available ${avail.toFixed(2)})`;
+    } else {
+      const avail = this.spotAvailable(sp.base);
+      if (o.sz > avail + 1e-9) return `Insufficient ${sp.base} balance (available ${avail})`;
+    }
+    return null;
   }
 
   private marginCheck(o: Order): string | null {
@@ -575,9 +719,72 @@ export class Engine {
     this.applyFill(o, o.px, Math.min(sz, o.sz), 'maker', time);
   }
 
+  private recordFill(o: Order, f: Omit<Fill, 'id' | 'oid' | 'coin' | 'side' | 'label' | 'twapId'>) {
+    const s = this.state;
+    const a = this.asset(o.coin);
+    o.sz = Math.max(0, o.sz - f.sz);
+    if (o.sz <= EPS || roundSize(o.sz, a.szDecimals) === 0) { o.sz = 0; this.finish(o, 'filled', 'Filled', f.time); }
+    const fill: Fill = { id: s.nextId++, oid: o.oid, coin: o.coin, side: o.side, label: this.label(o.coin), twapId: o.twapId, ...f };
+    s.fills.unshift(fill);
+    if (s.fills.length > 10_000) s.fills.length = 10_000;
+    if (o.twapId) {
+      const t = s.twaps.find((x) => x.id === o.twapId);
+      if (t) { t.filledSz += f.sz; t.notional += f.sz * f.px; t.lastMsg = undefined; }
+    } else {
+      this.onEvent({
+        type: f.liquidation ? 'liquidation' : 'fill',
+        msg: `${f.liquidation ? 'LIQUIDATED ' : ''}${f.dir} ${f.sz} ${this.label(o.coin)} @ ${f.px}${f.closedPnl ? ` (PnL ${f.closedPnl >= 0 ? '+' : ''}${f.closedPnl.toFixed(2)})` : ''}`,
+      });
+    }
+  }
+
+  /** spot fill: fees are taken from the token you receive; PnL uses average cost */
+  private applySpotFill(o: Order, px: number, sz: number, liquidity: 'maker' | 'taker', time: number) {
+    const s = this.state;
+    const a = this.asset(o.coin);
+    const { base, quote } = a.spot!;
+    const feeRate = liquidity === 'taker' ? s.settings.spotTakerFee : s.settings.spotMakerFee;
+    if (o.side === 'B') {
+      // can't spend more than we have (market orders estimate price up front)
+      const bal = s.spot[quote] ?? 0;
+      if (sz * px > bal + 1e-9) sz = roundSize(bal / px, a.szDecimals);
+    } else {
+      sz = Math.min(sz, s.spot[base] ?? 0);
+    }
+    sz = roundSize(sz, a.szDecimals);
+    if (sz <= EPS) { if (o.status === 'pending' || o.status === 'open') this.finish(o, 'canceled', 'Insufficient balance', time); return; }
+    const qPx = this.tokenPx(quote) || 1;
+    const value = px * sz;
+    const cb = (s.spotCost[base] ??= { sz: 0, cost: 0 });
+    let closedPnl = 0;
+    let fee: number;
+    if (o.side === 'B') {
+      const got = sz * (1 - feeRate);
+      s.spot[quote] = (s.spot[quote] ?? 0) - value;
+      s.spot[base] = (s.spot[base] ?? 0) + got;
+      cb.sz += got;
+      cb.cost += value * (1 - feeRate);
+      fee = value * feeRate * qPx;
+    } else {
+      const got = value * (1 - feeRate);
+      s.spot[base] = (s.spot[base] ?? 0) - sz;
+      s.spot[quote] = (s.spot[quote] ?? 0) + got;
+      const avg = cb.sz > EPS ? cb.cost / cb.sz : px;
+      const basisSz = Math.min(sz, cb.sz);
+      closedPnl = (px - avg) * basisSz * qPx;
+      cb.cost -= avg * basisSz;
+      cb.sz -= basisSz;
+      fee = value * feeRate * qPx;
+    }
+    for (const t of [base, quote]) if (Math.abs(s.spot[t]) < 1e-10) delete s.spot[t];
+    if (cb.sz <= 1e-10) delete s.spotCost[base];
+    this.recordFill(o, { px, sz, time, fee, closedPnl, dir: o.side === 'B' ? 'Buy' : 'Sell', liquidity, spot: true });
+  }
+
   private applyFill(o: Order, px: number, sz: number, liquidity: 'maker' | 'taker', time: number, liquidation = false) {
     const s = this.state;
     const a = this.asset(o.coin);
+    if (a.spot) return this.applySpotFill(o, px, sz, liquidity, time);
     let pos = s.positions[o.coin];
     // reduce-only: never flip or increase
     if (o.reduceOnly) {
@@ -637,16 +844,7 @@ export class Engine {
     }
     if (s.cash < 0 && liquidation) s.cash = 0; // backstop absorbs bad debt
 
-    o.sz = Math.max(0, o.sz - sz);
-    if (o.sz <= EPS || roundSize(o.sz, a.szDecimals) === 0) { o.sz = 0; this.finish(o, 'filled', 'Filled', time); }
-
-    const fill: Fill = { id: s.nextId++, oid: o.oid, coin: o.coin, side: o.side, px, sz, time, fee, closedPnl, dir, liquidity, liquidation };
-    s.fills.unshift(fill);
-    if (s.fills.length > 2000) s.fills.length = 2000;
-    this.onEvent({
-      type: liquidation ? 'liquidation' : 'fill',
-      msg: `${liquidation ? 'LIQUIDATED ' : ''}${dir} ${sz} ${o.coin} @ ${px}${closedPnl ? ` (PnL ${closedPnl >= 0 ? '+' : ''}${closedPnl.toFixed(2)})` : ''}`,
-    });
+    this.recordFill(o, { px, sz, time, fee, closedPnl, dir, liquidity, liquidation });
 
     if (!s.positions[o.coin]) this.onFlat(o.coin, time);
   }
@@ -661,6 +859,7 @@ export class Engine {
   private finish(o: Order, status: OrderStatus, msg: string, time: number) {
     o.status = status;
     o.statusMsg = msg;
+    if (o.quiet) return;
     this.state.history.push({ time, order: { ...o } });
     if (this.state.history.length > 2000) this.state.history.splice(0, this.state.history.length - 2000);
   }
@@ -690,7 +889,7 @@ export class Engine {
         sz = Math.abs(pos.szi);
       }
       this.finish(o, 'triggered', `Triggered at mark ${mark}`, now);
-      this.onEvent({ type: 'info', msg: `${o.coin} ${t.tpsl.toUpperCase()} triggered at ${mark}` });
+      this.onEvent({ type: 'info', msg: `${this.label(o.coin)} ${t.tpsl.toUpperCase()} triggered at ${mark}` });
       // spawn the child order immediately (trigger evaluation happens on the exchange)
       const child: Order = {
         oid: this.state.nextId++, coin: o.coin, side: o.side, kind: t.isMarket ? 'market' : 'limit',
@@ -700,7 +899,7 @@ export class Engine {
       if (t.isMarket) {
         // Hyperliquid uses 10% slippage for TP/SL market orders
         const mid = this.midPx(o.coin);
-        child.px = roundPrice(mid * (1 + sideSign(o.side) * 0.1), this.asset(o.coin).szDecimals, o.side === 'B' ? 'up' : 'down');
+        child.px = this.roundPx(o.coin, mid * (1 + sideSign(o.side) * 0.1), o.side === 'B' ? 'up' : 'down');
         child.kind = 'limit';
         child.tif = 'Ioc';
       }
@@ -810,6 +1009,99 @@ export class Engine {
     const a = this.asset(coin);
     const sz = roundSize(Math.abs(p.szi) * fraction, a.szDecimals) || Math.abs(p.szi);
     return this.placeOrder({ coin, side: p.szi > 0 ? 'A' : 'B', kind: limitPx ? 'limit' : 'market', px: limitPx, sz, reduceOnly: true, tif: 'Gtc' });
+  }
+
+  // ------------------------------------------------------------------- TWAP
+  placeTwap(req: { coin: string; side: Side; sz: number; minutes: number; randomize?: boolean; reduceOnly?: boolean }, now = Date.now()): PlaceResult {
+    const a = this.assets.get(req.coin);
+    if (!a) return { ok: false, error: 'Unknown asset' };
+    if (a.spot && req.reduceOnly) return { ok: false, error: 'Reduce only is not available for spot' };
+    if (!(req.minutes >= 5 && req.minutes <= 1440)) return { ok: false, error: 'TWAP duration must be between 5 minutes and 24 hours' };
+    const sz = roundSize(req.sz, a.szDecimals);
+    if (!(sz > 0)) return { ok: false, error: 'Order size must be positive' };
+    const durationMs = Math.round(req.minutes) * 60_000;
+    const slices = durationMs / TWAP_INTERVAL_MS;
+    const px = this.midPx(req.coin);
+    if (!px) return { ok: false, error: 'No price data yet' };
+    if ((sz / slices) * px < MIN_ORDER_NOTIONAL && !req.reduceOnly) {
+      return { ok: false, error: `Each TWAP sub-order must be worth at least $${MIN_ORDER_NOTIONAL}: increase size to ${fmtMin(MIN_ORDER_NOTIONAL * slices)} USD or shorten the duration` };
+    }
+    const t: Twap = {
+      id: this.state.nextId++, coin: req.coin, side: req.side, totalSz: sz, filledSz: 0, notional: 0,
+      startedAt: now, durationMs, randomize: !!req.randomize, reduceOnly: !!req.reduceOnly, status: 'running', nextAt: now,
+    };
+    this.state.twaps.unshift(t);
+    if (this.state.twaps.length > 500) this.state.twaps.length = 500;
+    this.onEvent({ type: 'info', msg: `TWAP started: ${req.side === 'B' ? 'Buy' : 'Sell'} ${sz} ${this.label(req.coin)} over ${req.minutes}m` });
+    this.changed();
+    return { ok: true, oid: t.id };
+  }
+
+  cancelTwap(id: number, now = Date.now()) {
+    const t = this.state.twaps.find((x) => x.id === id);
+    if (!t || t.status !== 'running') return;
+    t.status = 'canceled';
+    t.endedAt = now;
+    this.changed();
+  }
+
+  private stepTwap(t: Twap, now: number) {
+    const a = this.assets.get(t.coin);
+    if (!a) return;
+    const remaining = roundSize(t.totalSz - t.filledSz, a.szDecimals);
+    const end = t.startedAt + t.durationMs;
+    if (remaining <= 0 || now >= end + TWAP_INTERVAL_MS) {
+      t.status = 'completed';
+      t.endedAt = now;
+      const avg = t.filledSz ? t.notional / t.filledSz : 0;
+      this.onEvent({ type: 'info', msg: `TWAP finished: ${t.filledSz} / ${t.totalSz} ${this.label(t.coin)}${avg ? ` @ avg ${avg.toPrecision(6)}` : ''}` });
+      this.changed();
+      return;
+    }
+    t.nextAt = now + TWAP_INTERVAL_MS;
+    if (t.reduceOnly) {
+      const pos = this.state.positions[t.coin];
+      if (!pos || Math.sign(pos.szi) !== -sideSign(t.side)) { t.status = 'completed'; t.endedAt = now; t.lastMsg = 'Position closed'; this.changed(); return; }
+    }
+    const slices = t.durationMs / TWAP_INTERVAL_MS;
+    const sliceSz = t.totalSz / slices;
+    const done = Math.min(slices, Math.floor((now - t.startedAt) / TWAP_INTERVAL_MS) + 1);
+    const target = Math.min(t.totalSz, sliceSz * done);
+    let sz = Math.min(target - t.filledSz, 3 * sliceSz); // catch-up capped at 3x a normal slice
+    if (t.randomize) sz *= 0.8 + Math.random() * 0.4;
+    sz = roundSize(Math.min(sz, remaining), a.szDecimals);
+    if (sz <= 0) return;
+    const mid = this.midPx(t.coin);
+    if (!mid) return;
+    const o: Order = {
+      oid: this.state.nextId++, coin: t.coin, side: t.side, kind: 'limit',
+      px: this.roundPx(t.coin, mid * (1 + sideSign(t.side) * TWAP_SLIPPAGE), t.side === 'B' ? 'up' : 'down'),
+      sz, origSz: sz, tif: 'Ioc', reduceOnly: t.reduceOnly, status: 'pending', createdAt: now,
+      queueAhead: 0, queuePrevBook: 0, twapId: t.id, quiet: true,
+    };
+    this.state.orders.push(o);
+    this.arrive(o, now);
+    this.cleanup();
+    this.changed();
+  }
+
+  // --------------------------------------------------------- equity history
+  recordEquity(now = Date.now()) {
+    const h = this.state.equityHist;
+    h.push([now, this.summary().equity]);
+    // keep 1-minute resolution for the last 7 days, hourly before that
+    if (h.length > 20_000) {
+      const cutoff = now - 7 * 86_400_000;
+      const out: [number, number][] = [];
+      let lastHour = -1;
+      for (const p of h) {
+        if (p[0] >= cutoff) { out.push(p); continue; }
+        const hr = Math.floor(p[0] / 3_600_000);
+        if (hr !== lastHour) { out.push(p); lastHour = hr; }
+      }
+      this.state.equityHist = out;
+    }
+    this.changed();
   }
 
   reset(settings?: Partial<Settings>) {

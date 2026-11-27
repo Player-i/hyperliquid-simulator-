@@ -1,5 +1,5 @@
 import { useEffect, useReducer } from 'react';
-import { HLSocket, fetchMetaAndCtxs, type RawAssetCtx, type RawBook, type RawTrade, type WsStatus } from './api/hl';
+import { HLSocket, fetchMetaAndCtxs, fetchSpotMetaAndCtxs, type RawAssetCtx, type RawBook, type RawTrade, type WsStatus } from './api/hl';
 import { Engine, newState, DEFAULT_SETTINGS, type AssetInfo, type Book, type Ctx, type State, type Trade } from './engine/engine';
 
 const STORAGE_KEY = 'hlsim:state:v1';
@@ -7,6 +7,10 @@ const PREFS_KEY = 'hlsim:prefs:v1';
 
 export interface MarketRow extends AssetInfo {
   markPx: number; oraclePx: number; funding: number; prevDayPx: number; dayNtlVlm: number; openInterest: number; midPx: number | null;
+  /** spot only */
+  circulatingSupply?: number;
+  /** "BTC-USD" for perps, "HYPE/USDC" for spot */
+  display: string;
 }
 
 function loadState(): State | undefined {
@@ -22,14 +26,18 @@ function loadState(): State | undefined {
     }
     s.orders = s.orders.filter((o) => o.status === 'open');
     s.settings = { ...DEFAULT_SETTINGS, ...s.settings };
+    // TWAPs keep running across reloads, from where they left off
+    for (const t of s.twaps ?? []) if (t.status === 'running') t.nextAt = Date.now();
     return s;
   } catch { return undefined; }
 }
 
-export interface Prefs { coin: string; interval: string; favorites: string[] }
+export type View = 'trade' | 'portfolio';
+export interface Prefs { coin: string; interval: string; favorites: string[]; view: View }
+const DEFAULT_PREFS: Prefs = { coin: 'BTC', interval: '15m', favorites: ['BTC', 'ETH', 'SOL', 'HYPE', '@107'], view: 'trade' };
 function loadPrefs(): Prefs {
-  try { return { coin: 'BTC', interval: '15m', favorites: ['BTC', 'ETH', 'SOL', 'HYPE'], ...JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') }; }
-  catch { return { coin: 'BTC', interval: '15m', favorites: ['BTC', 'ETH', 'SOL', 'HYPE'] }; }
+  try { return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') }; }
+  catch { return { ...DEFAULT_PREFS }; }
 }
 
 export interface Toast { id: number; type: string; msg: string }
@@ -49,6 +57,7 @@ class Store {
   private bookSubs = new Map<string, () => void>();
   private dirty = false;
   private toastId = 1;
+  private warnedStorage = false;
 
   constructor() {
     this.engine.subscribe(() => { this.dirty = true; this.notify(); });
@@ -80,13 +89,17 @@ class Store {
     setInterval(() => this.engine.tick(Date.now()), 50);
     setInterval(() => this.syncSubscriptions(), 1_000);
     setInterval(() => this.persist(), 1_000);
+    this.engine.recordEquity();
+    setInterval(() => this.engine.recordEquity(), 60_000);
     window.addEventListener('beforeunload', () => { this.dirty = true; this.persist(); });
     this.notify();
   }
 
   private async refreshMarkets() {
     try {
-      const [meta, ctxs] = await fetchMetaAndCtxs();
+      const [perp, spot] = await Promise.allSettled([fetchMetaAndCtxs(), fetchSpotMetaAndCtxs()]);
+      if (perp.status === 'rejected') throw perp.reason;
+      const [meta, ctxs] = perp.value;
       const tables = new Map(meta.marginTables.map(([id, t]) => [id, t.marginTiers]));
       const rows: MarketRow[] = [];
       const ctxMap: Record<string, Ctx> = {};
@@ -99,11 +112,29 @@ class Store {
           coin: u.name, szDecimals: u.szDecimals, maxLeverage: u.maxLeverage, tiers, onlyIsolated: u.onlyIsolated,
           markPx: Number(c.markPx), oraclePx: Number(c.oraclePx), funding: Number(c.funding),
           prevDayPx: Number(c.prevDayPx), dayNtlVlm: Number(c.dayNtlVlm), openInterest: Number(c.openInterest),
-          midPx: c.midPx ? Number(c.midPx) : null,
+          midPx: c.midPx ? Number(c.midPx) : null, display: `${u.name}-USD`,
         };
         rows.push(row);
         ctxMap[u.name] = { markPx: row.markPx, oraclePx: row.oraclePx, funding: row.funding, midPx: row.midPx };
       });
+      if (spot.status === 'fulfilled') {
+        const [smeta, sctxs] = spot.value;
+        const tokens = new Map(smeta.tokens.map((t) => [t.index, t]));
+        const sc = new Map(sctxs.map((c) => [c.coin, c]));
+        for (const u of smeta.universe) {
+          const c = sc.get(u.name);
+          const base = tokens.get(u.tokens[0]), quote = tokens.get(u.tokens[1]);
+          if (!c || !base || !quote) continue;
+          const mark = Number(c.markPx);
+          const name = `${base.name}/${quote.name}`;
+          rows.push({
+            coin: u.name, szDecimals: base.szDecimals, maxLeverage: 1, tiers: [], spot: { name, base: base.name, quote: quote.name },
+            markPx: mark, oraclePx: mark, funding: 0, prevDayPx: Number(c.prevDayPx), dayNtlVlm: Number(c.dayNtlVlm),
+            openInterest: 0, midPx: c.midPx ? Number(c.midPx) : null, circulatingSupply: Number(c.circulatingSupply), display: name,
+          });
+          ctxMap[u.name] = { markPx: mark, oraclePx: mark, funding: 0, midPx: c.midPx ? Number(c.midPx) : null };
+        }
+      }
       this.markets = rows;
       this.marketsByCoin = new Map(rows.map((r) => [r.coin, r]));
       this.engine.setAssets(rows);
@@ -122,6 +153,7 @@ class Store {
     const need = new Set<string>([this.prefs.coin]);
     for (const c of Object.keys(this.engine.state.positions)) need.add(c);
     for (const o of this.engine.state.orders) need.add(o.coin);
+    for (const t of this.engine.state.twaps) if (t.status === 'running') need.add(t.coin);
     for (const [coin, unsub] of this.bookSubs) if (!need.has(coin)) { unsub(); this.bookSubs.delete(coin); }
     for (const coin of need) {
       if (this.bookSubs.has(coin) || !this.marketsByCoin.has(coin)) continue;
@@ -133,11 +165,17 @@ class Store {
         this.engine.onTrades(ts);
         this.notify();
       });
-      const u3 = this.socket.subscribe({ type: 'activeAssetCtx', coin }, (d: { coin: string; ctx: RawAssetCtx }) => {
+      const u3 = this.socket.subscribe({ type: 'activeAssetCtx', coin }, (d: { coin: string; ctx: Partial<RawAssetCtx> & { markPx: string } }) => {
         const c = d.ctx;
         const m = this.marketsByCoin.get(coin);
-        if (m) { m.markPx = Number(c.markPx); m.oraclePx = Number(c.oraclePx); m.funding = Number(c.funding); m.openInterest = Number(c.openInterest); m.dayNtlVlm = Number(c.dayNtlVlm); m.prevDayPx = Number(c.prevDayPx); }
-        this.engine.onCtxs({ [coin]: { markPx: Number(c.markPx), oraclePx: Number(c.oraclePx), funding: Number(c.funding), midPx: c.midPx ? Number(c.midPx) : null } });
+        const mark = Number(c.markPx);
+        const oracle = c.oraclePx ? Number(c.oraclePx) : mark;
+        const funding = c.funding ? Number(c.funding) : 0;
+        if (m) {
+          m.markPx = mark; m.oraclePx = oracle; m.funding = funding; m.dayNtlVlm = Number(c.dayNtlVlm); m.prevDayPx = Number(c.prevDayPx);
+          if (c.openInterest) m.openInterest = Number(c.openInterest);
+        }
+        this.engine.onCtxs({ [coin]: { markPx: mark, oraclePx: oracle, funding, midPx: c.midPx ? Number(c.midPx) : null } });
       });
       this.bookSubs.set(coin, () => { u1(); u2(); u3(); });
     }
@@ -151,6 +189,10 @@ class Store {
   }
 
   setInterval(i: string) { this.prefs.interval = i; this.savePrefs(); this.notify(); }
+
+  setView(v: View) { this.prefs.view = v; this.savePrefs(); this.notify(); }
+
+  display(coin: string) { return this.marketsByCoin.get(coin)?.display ?? this.engine.label(coin); }
 
   toggleFavorite(coin: string) {
     const f = this.prefs.favorites;
@@ -166,7 +208,9 @@ class Store {
     this.dirty = false;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(this.engine.state, (_k, v) => (v === Number.POSITIVE_INFINITY ? null : v)));
-    } catch { /* storage full or blocked */ }
+    } catch {
+      if (!this.warnedStorage) { this.warnedStorage = true; this.toast('reject', 'Could not save your account to browser storage (full or blocked).'); }
+    }
   }
 }
 

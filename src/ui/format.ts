@@ -1,14 +1,14 @@
 import { priceDecimals } from '../engine/rules';
 
-export function pxDecimals(px: number, szDecimals: number) {
+export function pxDecimals(px: number, szDecimals: number, spot = false) {
   if (!(px > 0)) return 2;
   const mag = Math.floor(Math.log10(px));
-  return Math.min(Math.max(0, 4 - mag), priceDecimals(szDecimals));
+  return Math.min(Math.max(0, 4 - mag), priceDecimals(szDecimals, spot));
 }
 
-export function fmtPx(px: number | null | undefined, szDecimals: number) {
+export function fmtPx(px: number | null | undefined, szDecimals: number, spot = false) {
   if (px == null || !Number.isFinite(px) || px <= 0) return '—';
-  const d = pxDecimals(px, szDecimals);
+  const d = pxDecimals(px, szDecimals, spot);
   return px.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
 }
 
@@ -34,6 +34,20 @@ export function fmtPct(v: number, d = 2) {
 
 export function fmtCompact(v: number) {
   return '$' + Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 2 }).format(v);
+}
+
+export function fmtNum(v: number, maxD = 6) {
+  return v.toLocaleString('en-US', { maximumFractionDigits: maxD });
+}
+
+export function fmtDate(t: number) {
+  const d = new Date(t);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** lightweight-charts renders UTC; shift timestamps so the axis shows local time */
+export function localSec(t: number) {
+  return Math.floor((t - new Date(t).getTimezoneOffset() * 60_000) / 1000);
 }
 
 export function fmtTime(t: number) {
