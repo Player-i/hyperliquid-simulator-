@@ -58,8 +58,9 @@ function MarketSelector({ onClose, initialTab }: { onClose: () => void; initialT
         : tab === 'spot' ? !!m.spot
         : tab === 'hip3' ? !!m.dex && (dex === 'all' || m.dex === dex)
         : !m.spot && !m.dex;
-      if (!inTab) return false;
-      return !ql || m.display.toLowerCase().includes(ql) || m.coin.toLowerCase() === ql;
+      // typing searches every market (perps, stocks/HIP-3 and spot), whatever tab is open
+      if (ql) return m.display.toLowerCase().includes(ql) || m.coin.toLowerCase() === ql;
+      return inTab;
     });
     const key = (m: MarketRow) =>
       sort === 'vol' ? m.dayNtlVlm : sort === 'change' ? (m.prevDayPx ? m.markPx / m.prevDayPx - 1 : 0)
@@ -79,7 +80,7 @@ function MarketSelector({ onClose, initialTab }: { onClose: () => void; initialT
     <>
       <div style={{ position: 'fixed', inset: 0, zIndex: 39 }} onClick={onClose} />
       <div className="selector">
-        <input className="search" autoFocus placeholder="Search markets" value={q} onChange={(e) => setQ(e.target.value)} />
+        <input className="search" autoFocus placeholder="Search all markets: BTC, TSLA, NVDA, HYPE…" value={q} onChange={(e) => setQ(e.target.value)} />
         <div className="tabs">
           <button className={tab === 'fav' ? 'active' : ''} onClick={() => setTab('fav')}>Favorites</button>
           <button className={tab === 'perps' ? 'active' : ''} onClick={() => setTab('perps')}>Perps</button>
@@ -110,7 +111,7 @@ function MarketSelector({ onClose, initialTab }: { onClose: () => void; initialT
                 return (
                   <tr key={m.coin} onClick={() => { s.setCoin(m.coin); onClose(); }}>
                     <td><button className={`star ${fav ? 'on' : ''}`} aria-label="Favorite" onClick={(e) => { e.stopPropagation(); s.toggleFavorite(m.coin); }}>★</button></td>
-                    <td><b>{m.display}</b> <span className="faint">{m.spot ? 'Spot' : `${m.maxLeverage}x`}</span></td>
+                    <td><b>{m.display}</b> <span className="faint">{m.spot ? 'Spot' : m.dex ? `${m.maxLeverage}x · HIP-3` : `${m.maxLeverage}x`}</span></td>
                     <td className="num">{fmtPx(m.markPx, m.szDecimals, !!m.spot)}</td>
                     <td className={`num ${ch >= 0 ? 'up' : 'down'}`}>{fmtPct(ch)}</td>
                     {!spotTab && <td className="num">{m.spot ? '—' : `${(m.funding * 8 * 100).toFixed(4)}%`}</td>}
