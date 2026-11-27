@@ -172,6 +172,17 @@ describe('pnl, triggers, liquidation, funding', () => {
     expect(e.state.fills[0].px).toBe(58900);
   });
 
+  it('TP/SL attached to a perp limit entry arms on the first fill', () => {
+    const e = mkEngine();
+    e.onBook(BOOK);
+    e.placeOrder({ coin: 'BTC', side: 'B', kind: 'limit', px: 59999, sz: 0.1, tpsl: { tp: 62000, sl: 58000 } }, T0);
+    expect(e.state.orders.filter((o) => o.kind === 'trigger').length).toBe(0);
+    e.onTrades([{ coin: 'BTC', side: 'A', px: 59990, sz: 1, time: T0 + 10 }]);
+    const trg = e.state.orders.filter((o) => o.kind === 'trigger');
+    expect(trg.length).toBe(2);
+    expect(trg.every((o) => o.trigger!.positionTpsl)).toBe(true);
+  });
+
   it('liquidates cross position when account value < maintenance', () => {
     const e = mkEngine(1000);
     e.onBook(BOOK);
@@ -295,5 +306,77 @@ describe('twap', () => {
     const e = mkEngine();
     e.onBook(BOOK);
     expect(e.placeTwap({ coin: 'BTC', side: 'B', sz: 0.001, minutes: 60 }, T0).ok).toBe(false);
+  });
+});
+
+describe('scale orders', () => {
+  it('builds a linear-skew ladder that sums to the total', () => {
+    const e = mkEngine();
+    const l = e.scaleLadder('BTC', 1, 59000, 58000, 5, 3);
+    expect(l.map((x) => x.px)).toEqual([59000, 58750, 58500, 58250, 58000]);
+    expect(l.reduce((a, x) => a + x.sz, 0)).toBeCloseTo(1, 8);
+    expect(l[4].sz / l[0].sz).toBeCloseTo(3, 1);
+  });
+
+  it('places every rung as a resting limit order', () => {
+    const e = mkEngine(100_000);
+    e.onBook(BOOK);
+    const r = e.placeScale({ coin: 'BTC', side: 'B', sz: 0.5, startPx: 59990, endPx: 59000, n: 4, skew: 1 }, T0);
+    expect(r.ok).toBe(true);
+    expect(e.state.orders.filter((o) => o.status === 'open').map((o) => o.px)).toEqual([59990, 59660, 59330, 59000]);
+  });
+
+  it('rejects rungs under $10', () => {
+    const e = mkEngine();
+    e.onBook(BOOK);
+    expect(e.placeScale({ coin: 'BTC', side: 'B', sz: 0.0005, startPx: 59990, endPx: 59000, n: 10, skew: 1 }, T0).ok).toBe(false);
+  });
+});
+
+describe('spot TP/SL', () => {
+  function held() {
+    const e = mkEngine();
+    e.setAssets([{ coin: '@107', szDecimals: 2, maxLeverage: 1, tiers: [], spot: { name: 'HYPE/USDC', base: 'HYPE', quote: 'USDC' } }]);
+    e.onBook({ coin: '@107', time: T0, bids: [{ px: 39.99, sz: 100, n: 1 }], asks: [{ px: 40.01, sz: 100, n: 1 }] });
+    e.transfer(1000, true);
+    e.placeOrder({ coin: '@107', side: 'B', kind: 'market', sz: 10 }, T0);
+    return e;
+  }
+
+  it('stop loss sells the holding when mark falls and cancels the paired TP', () => {
+    const e = held();
+    const bal = e.state.spot.HYPE;
+    e.placeOrder({ coin: '@107', side: 'A', kind: 'trigger', sz: 10, trigger: { triggerPx: 38, isMarket: true, tpsl: 'sl' } }, T0);
+    e.placeOrder({ coin: '@107', side: 'A', kind: 'trigger', sz: 10, trigger: { triggerPx: 45, isMarket: true, tpsl: 'tp' } }, T0);
+    expect(e.state.orders.filter((o) => o.kind === 'trigger').length).toBe(2);
+    e.onBook({ coin: '@107', time: T0 + 5, bids: [{ px: 37.9, sz: 100, n: 1 }], asks: [{ px: 37.95, sz: 100, n: 1 }] });
+    e.onCtxs({ '@107': { markPx: 37.92, oraclePx: 37.92, funding: 0, midPx: 37.92 } }, T0 + 5);
+    // sells what we actually hold (10 minus the fee taken in HYPE), rounded to lot size
+    expect(e.state.fills[0].sz).toBeCloseTo(Math.floor(bal * 100) / 100, 8);
+    expect(e.state.fills[0].px).toBe(37.9);
+    expect(e.state.orders.filter((o) => o.kind === 'trigger').length).toBe(0);
+  });
+
+  it('TP/SL attached to a spot buy activates on fill, sized to what was received', () => {
+    const e = mkEngine();
+    e.setAssets([{ coin: '@107', szDecimals: 2, maxLeverage: 1, tiers: [], spot: { name: 'HYPE/USDC', base: 'HYPE', quote: 'USDC' } }]);
+    e.onBook({ coin: '@107', time: T0, bids: [{ px: 39.99, sz: 100, n: 1 }], asks: [{ px: 40.01, sz: 100, n: 1 }] });
+    e.transfer(1000, true);
+    e.placeOrder({ coin: '@107', side: 'B', kind: 'limit', px: 39.5, sz: 10, tpsl: { tp: 45, sl: 35 } }, T0);
+    expect(e.state.orders.filter((o) => o.kind === 'trigger').length).toBe(0); // not filled yet
+    e.onTrades([{ coin: '@107', side: 'A', px: 39.4, sz: 50, time: T0 + 10 }]); // trades through our bid
+    const trg = e.state.orders.filter((o) => o.kind === 'trigger');
+    expect(trg.map((o) => o.trigger!.tpsl).sort()).toEqual(['sl', 'tp']);
+    expect(trg[0].sz).toBeCloseTo(Math.floor(10 * (1 - 0.0004) * 100) / 100, 8);
+  });
+
+  it('rejects a sell trigger with no balance', () => {
+    const e = mkEngine();
+    e.setAssets([{ coin: '@107', szDecimals: 2, maxLeverage: 1, tiers: [], spot: { name: 'HYPE/USDC', base: 'HYPE', quote: 'USDC' } }]);
+    const msgs: string[] = [];
+    e.onEvent = (ev) => msgs.push(ev.msg);
+    e.onCtxs({ '@107': { markPx: 40, oraclePx: 40, funding: 0, midPx: 40 } }, T0);
+    e.placeOrder({ coin: '@107', side: 'A', kind: 'trigger', sz: 1, trigger: { triggerPx: 30, isMarket: true, tpsl: 'sl' } }, T0);
+    expect(msgs[0]).toMatch(/No HYPE balance/);
   });
 });

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { Order } from '../engine/engine';
 import { useStore } from '../store';
 import { fmtDateTime, fmtNum, fmtPx, fmtSigned, fmtSz, fmtUsd, pnlClass } from './format';
-import { LimitCloseModal, MarginModal, TpslModal } from './Modals';
+import { LimitCloseModal, MarginModal, SpotTpslModal, TpslModal } from './Modals';
 
 type Tab = 'balances' | 'positions' | 'orders' | 'twap' | 'trades' | 'funding' | 'history';
 
@@ -229,16 +229,18 @@ function Balances() {
   const sum = e.summary();
   const tokens = Object.entries(e.state.spot).sort((a, b) => b[1] * e.tokenPx(b[0]) - a[1] * e.tokenPx(a[0]));
   const pairFor = (token: string) => s.markets.find((m) => m.spot?.base === token && m.spot.quote === 'USDC');
+  const [tpslFor, setTpslFor] = useState<string | null>(null);
+  const triggersFor = (pairCoin: string) => e.state.orders.filter((o) => o.coin === pairCoin && o.kind === 'trigger' && o.side === 'A' && o.status === 'open');
   return (
     <table className="table">
-      <thead><tr><th>Coin</th><th>Total Balance</th><th>Available Balance</th><th>USDC Value</th><th>Avg Cost</th><th>PnL (ROE %)</th><th></th></tr></thead>
+      <thead><tr><th>Coin</th><th>Total Balance</th><th>Available Balance</th><th>USDC Value</th><th>Avg Cost</th><th>PnL (ROE %)</th><th>TP / SL</th><th></th></tr></thead>
       <tbody>
         <tr>
           <td>USDC <span className="faint">(Perps)</span></td>
           <td>{fmtNum(sum.perpEquity, 2)} USDC</td>
           <td>{fmtNum(sum.available, 2)} USDC</td>
           <td>{fmtUsd(sum.perpEquity)}</td>
-          <td>--</td><td>--</td><td />
+          <td>--</td><td>--</td><td>--</td><td />
         </tr>
         {tokens.map(([t, amt]) => {
           const px = e.tokenPx(t);
@@ -254,11 +256,25 @@ function Balances() {
               <td>{px ? fmtUsd(amt * px) : '—'}</td>
               <td>{avg ? fmtPx(avg, pair?.szDecimals ?? 2, true) : '--'}</td>
               <td className={pnlClass(pnl)}>{avg ? `${fmtSigned(pnl)} (${((px / avg - 1) * 100).toFixed(1)}%)` : '--'}</td>
+              <td>
+                {pair ? (() => {
+                  const trg = triggersFor(pair.coin);
+                  const tp = trg.find((o) => o.trigger?.tpsl === 'tp')?.trigger?.triggerPx;
+                  const sl = trg.find((o) => o.trigger?.tpsl === 'sl')?.trigger?.triggerPx;
+                  return (
+                    <>
+                      <span className="num">{tp ? fmtPx(tp, pair.szDecimals, true) : '--'} / {sl ? fmtPx(sl, pair.szDecimals, true) : '--'}</span>
+                      <button className="btn small" style={{ marginLeft: 6 }} aria-label={`Set ${t} TP/SL`} onClick={() => setTpslFor(pair.coin)}>✎</button>
+                    </>
+                  );
+                })() : '--'}
+              </td>
               <td>{pair && <button className="btn small" onClick={() => s.setCoin(pair.coin)}>Trade</button>}</td>
             </tr>
           );
         })}
-        {!tokens.length && <tr><td colSpan={7} className="muted">No spot balances. Use “Transfer Perps ⇄ Spot” to fund your spot account.</td></tr>}
+        {tpslFor && <tr><td colSpan={8} style={{ padding: 0, border: 0 }}><SpotTpslModal coin={tpslFor} onClose={() => setTpslFor(null)} /></td></tr>}
+        {!tokens.length && <tr><td colSpan={8} className="muted">No spot balances. Use “Transfer Perps ⇄ Spot” to fund your spot account.</td></tr>}
       </tbody>
     </table>
   );

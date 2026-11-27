@@ -23,13 +23,15 @@ The app is fully client-side: your browser connects straight to Hyperliquid's pu
 |---|---|
 | **Markets** | Every live Hyperliquid perp, with its real `szDecimals`, max leverage and margin tiers, plus every spot pair (HYPE/USDC, UBTC/USDC, PURR/USDC, …) |
 | **Spot** | Perps and spot have separate balances, as on Hyperliquid, and you move USDC between them with *Transfer*. Buys and sells fill against the live spot book. Fees default to 0.070% taker and 0.040% maker, and are taken from the token you receive. The **Balances** tab shows each holding's average cost and unrealized PnL. Pairs quoted in tokens other than USDC (e.g. USDT0) need that token first. |
+| **Scale orders** | Like Hyperliquid's: N limit orders (2–100) spaced evenly from a start price to an end price. Sizes grow linearly so the last order is *skew* × the first (skew 1 = equal sizes). Every rung must be at least $10, and each one then rests and fills with the normal queue simulation. While choosing a scale order, clicking the order book sets the start price, then the end price. |
 | **TWAP** | Like Hyperliquid's TWAP: one market sub-order every 30 s, with at most 3% slippage per sub-order. If earlier sub-orders didn't fill, later ones catch up, capped at 3× a normal slice. Optional size randomization. Duration is 5 min to 24 h, and each sub-order must be at least $10. The **TWAP** tab shows progress and average price. A running TWAP picks up again when you reopen the app. |
 | **Market orders** | Walk the live L2 book level by level, so you get the real depth and real slippage. They're capped at 8% max slippage from mid, like Hyperliquid's default. Liquidity you take is removed from a local overlay, so two orders can't fill at the same level until the real book refreshes. |
 | **Limit orders (GTC)** | The part that crosses the book fills as taker. The remainder rests at the **back of the queue** at its price. |
 | **Queue position** | Your queue position shrinks when real trades print at your price and when size ahead of you is cancelled. You fill only when real aggressive flow reaches you, a trade prints *through* your price, or the book crosses your price. The **Open Orders** tab shows how much size is still ahead of you. |
 | **ALO / IOC** | Post-only orders are rejected if they would cross. IOC orders cancel any unfilled remainder. |
 | **PnL tracker** | A separate *PnL Tracker* view. You can filter by date range (24H, 7D, 30D, 90D, YTD, all time, or custom from/to dates), market (perps or spot), coin, and longs vs. shorts, and include or exclude funding. It shows net PnL, realized PnL, fees, funding, volume, win rate, profit factor, average win and loss, best and worst trade, green days and max drawdown. Charts: cumulative net PnL, daily net PnL and account equity. Tables break results down by coin, by day, by closed trade, and as a full ledger. Everything can be exported to CSV. |
-| **Trigger orders** | Stop Market/Limit and Take Profit Market/Limit, plus position TP/SL. They trigger on **mark price**, like Hyperliquid. Market triggers use 10% slippage. |
+| **Trigger orders** | Stop Market/Limit and Take Profit Market/Limit on both perps and spot, plus position TP/SL. They trigger on **mark price**, like Hyperliquid. Market triggers use 10% slippage. TP/SL attached to an entry order only activates once that entry fills. |
+| **Spot TP/SL** | Attach a TP/SL when you buy, or set one on any holding from the ✎ button in the **Balances** tab. It sells the tokens you actually received after fees, capped at your balance when it triggers. When a sale empties your balance, the other trigger is canceled, just as a perps position TP/SL is when the position closes. |
 | **Tick/lot rules** | Prices use at most 5 significant figures and at most `6 - szDecimals` decimals. Sizes are rounded to `szDecimals`. Minimum order value is $10. Limit prices more than 80% from the reference price are rejected. |
 | **Fees** | Base tier: 0.045% taker and 0.015% maker. You can change these in Settings, including negative maker fees for rebates. |
 | **Margin** | Cross and isolated margin, with per-asset leverage limited by the asset's margin tiers. Resting orders reserve margin. In isolated mode you can add or remove margin. |
@@ -40,7 +42,7 @@ The app is fully client-side: your browser connects straight to Hyperliquid's pu
 ### Known limitations
 - Hyperliquid's public book feed shows the top 20 levels on each side. If a resting order sits deeper than that, its queue position is unknown until the price comes into view.
 - Your simulated orders don't move the real market. On illiquid coins, a fill you'd really get could push the price, and that impact isn't modelled after your own fill.
-- Scale orders, spot TP/SL and partial liquidations aren't modelled yet.
+- Partial liquidations and Hyperliquid's builder-deployed (HIP-3) perp markets aren't modelled yet.
 - The account equity curve is sampled once a minute, and only while the app is open. Realized PnL, fees and funding come from the full trade history, which keeps the last 10,000 fills.
 
 ## Code layout

@@ -103,6 +103,10 @@ export interface Order {
   twapId?: number;
   /** internal order: no toasts / order-history rows */
   quiet?: boolean;
+  /** TP/SL attached to this entry; placed once it fills */
+  tpsl?: { tp?: number; sl?: number };
+  /** amount received so far (spot: after fee) */
+  recv?: number;
 }
 
 export interface Twap {
@@ -187,6 +191,8 @@ export interface OrderRequest {
   tif?: Tif;
   reduceOnly?: boolean;
   trigger?: Trigger;
+  /** TP/SL prices that activate when this order fills (sized to the fill) */
+  tpsl?: { tp?: number; sl?: number };
 }
 
 export interface PlaceResult { ok: boolean; oid?: number; error?: string }
@@ -574,7 +580,9 @@ export class Engine {
       reduceOnly: !!req.reduceOnly || !!req.trigger?.positionTpsl,
       trigger: req.trigger ? { ...req.trigger } : undefined,
       status: 'pending', createdAt: now, queueAhead: 0, queuePrevBook: 0,
+      tpsl: req.tpsl && (req.tpsl.tp || req.tpsl.sl) && !req.trigger && !req.reduceOnly ? { ...req.tpsl } : undefined,
     };
+    if (order.tpsl && a.spot && req.side !== 'B') return { ok: false, error: 'Spot TP/SL can only be attached to buys' };
     this.state.orders.push(order);
     this.changed();
     this.schedule(() => this.arrive(order, Date.now()), now);
@@ -616,6 +624,8 @@ export class Engine {
       o.sz = Math.min(o.sz, Math.abs(pos.szi));
     }
     if (o.kind === 'trigger') {
+      const sp = this.assets.get(o.coin)?.spot;
+      if (sp && o.side === 'A' && !((this.state.spot[sp.base] ?? 0) > 0)) return reject(`No ${sp.base} balance to sell`);
       o.status = 'open';
       this.state.history.push({ time: now, order: { ...o } });
       this.changed();
@@ -719,9 +729,12 @@ export class Engine {
     this.applyFill(o, o.px, Math.min(sz, o.sz), 'maker', time);
   }
 
-  private recordFill(o: Order, f: Omit<Fill, 'id' | 'oid' | 'coin' | 'side' | 'label' | 'twapId'>) {
+  private recordFill(o: Order, f: Omit<Fill, 'id' | 'oid' | 'coin' | 'side' | 'label' | 'twapId'>, received = f.sz) {
     const s = this.state;
     const a = this.asset(o.coin);
+    o.recv = (o.recv ?? 0) + received;
+    // perps: position TP/SL covers the whole position, so arm it on the first fill
+    if (o.tpsl && !a.spot) this.spawnTpsl(o, f.time);
     o.sz = Math.max(0, o.sz - f.sz);
     if (o.sz <= EPS || roundSize(o.sz, a.szDecimals) === 0) { o.sz = 0; this.finish(o, 'filled', 'Filled', f.time); }
     const fill: Fill = { id: s.nextId++, oid: o.oid, coin: o.coin, side: o.side, label: this.label(o.coin), twapId: o.twapId, ...f };
@@ -778,7 +791,15 @@ export class Engine {
     }
     for (const t of [base, quote]) if (Math.abs(s.spot[t]) < 1e-10) delete s.spot[t];
     if (cb.sz <= 1e-10) delete s.spotCost[base];
-    this.recordFill(o, { px, sz, time, fee, closedPnl, dir: o.side === 'B' ? 'Buy' : 'Sell', liquidity, spot: true });
+    if (o.side === 'A' && roundSize(s.spot[base] ?? 0, a.szDecimals) === 0) {
+      // like a closed position: the holding is gone, so its TP/SL sell triggers are canceled
+      for (const x of s.orders) {
+        if (x !== o && x.kind === 'trigger' && x.side === 'A' && (x.status === 'open' || x.status === 'pending') && this.assets.get(x.coin)?.spot?.base === base) {
+          this.finish(x, 'canceled', `${base} balance sold`, time);
+        }
+      }
+    }
+    this.recordFill(o, { px, sz, time, fee, closedPnl, dir: o.side === 'B' ? 'Buy' : 'Sell', liquidity, spot: true }, o.side === 'B' ? sz * (1 - feeRate) : sz);
   }
 
   private applyFill(o: Order, px: number, sz: number, liquidity: 'maker' | 'taker', time: number, liquidation = false) {
@@ -859,9 +880,27 @@ export class Engine {
   private finish(o: Order, status: OrderStatus, msg: string, time: number) {
     o.status = status;
     o.statusMsg = msg;
+    // spot: arm attached TP/SL for whatever the entry actually bought
+    if (o.tpsl && (o.recv ?? 0) > 0) this.spawnTpsl(o, time);
     if (o.quiet) return;
     this.state.history.push({ time, order: { ...o } });
     if (this.state.history.length > 2000) this.state.history.splice(0, this.state.history.length - 2000);
+  }
+
+  private spawnTpsl(o: Order, now: number) {
+    const t = o.tpsl;
+    if (!t) return;
+    o.tpsl = undefined;
+    const a = this.asset(o.coin);
+    const exit: Side = o.side === 'B' ? 'A' : 'B';
+    const sz = a.spot ? roundSize(o.recv ?? 0, a.szDecimals) : o.origSz;
+    if (!(sz > 0)) return;
+    for (const kind of ['tp', 'sl'] as const) {
+      const px = t[kind];
+      if (!px) continue;
+      const r = this.placeOrder({ coin: o.coin, side: exit, kind: 'trigger', sz, trigger: { triggerPx: px, isMarket: true, tpsl: kind, positionTpsl: !a.spot } }, now);
+      if (!r.ok) this.onEvent({ type: 'reject', msg: `${this.label(o.coin)} ${kind.toUpperCase()}: ${r.error}` });
+    }
   }
 
   private cleanup() {
@@ -887,6 +926,12 @@ export class Engine {
       if (t.positionTpsl) {
         if (!pos || Math.sign(pos.szi) !== -sideSign(o.side)) { this.finish(o, 'canceled', 'No position', now); continue; }
         sz = Math.abs(pos.szi);
+      }
+      const sp = this.assets.get(o.coin)?.spot;
+      if (sp && o.side === 'A') {
+        // spot TP/SL sells what you still hold, up to the order size
+        sz = roundSize(Math.min(sz, this.spotAvailable(sp.base)), this.asset(o.coin).szDecimals);
+        if (sz <= 0) { this.finish(o, 'canceled', `No ${sp.base} balance left`, now); continue; }
       }
       this.finish(o, 'triggered', `Triggered at mark ${mark}`, now);
       this.onEvent({ type: 'info', msg: `${this.label(o.coin)} ${t.tpsl.toUpperCase()} triggered at ${mark}` });
@@ -1009,6 +1054,48 @@ export class Engine {
     const a = this.asset(coin);
     const sz = roundSize(Math.abs(p.szi) * fraction, a.szDecimals) || Math.abs(p.szi);
     return this.placeOrder({ coin, side: p.szi > 0 ? 'A' : 'B', kind: limitPx ? 'limit' : 'market', px: limitPx, sz, reduceOnly: true, tif: 'Gtc' });
+  }
+
+  // ------------------------------------------------------------------ scale
+  /**
+   * Hyperliquid scale order ladder: `n` limit orders evenly spaced from startPx to endPx.
+   * Sizes grow linearly so the last order is `skew` times the first.
+   */
+  scaleLadder(coin: string, totalSz: number, startPx: number, endPx: number, n: number, skew: number): { px: number; sz: number }[] {
+    const a = this.assets.get(coin);
+    if (!a || !(n >= 2) || !(skew > 0) || !(totalSz > 0) || !(startPx > 0) || !(endPx > 0)) return [];
+    n = Math.floor(n);
+    const first = (2 * totalSz) / (n * (1 + skew));
+    const out: { px: number; sz: number }[] = [];
+    let used = 0;
+    for (let i = 0; i < n; i++) {
+      const f = i / (n - 1);
+      const px = this.roundPx(coin, startPx + (endPx - startPx) * f);
+      const sz = i === n - 1 ? roundSize(totalSz - used, a.szDecimals) : roundSize(first * (1 + (skew - 1) * f), a.szDecimals);
+      used += sz;
+      out.push({ px, sz });
+    }
+    return out;
+  }
+
+  placeScale(req: { coin: string; side: Side; sz: number; startPx: number; endPx: number; n: number; skew: number; reduceOnly?: boolean }, now = Date.now()): PlaceResult & { oids?: number[] } {
+    if (!this.assets.has(req.coin)) return { ok: false, error: 'Unknown asset' };
+    if (!(req.n >= 2 && req.n <= 100)) return { ok: false, error: 'Total orders must be between 2 and 100' };
+    if (!(req.skew >= 0.01 && req.skew <= 100)) return { ok: false, error: 'Size skew must be between 0.01 and 100' };
+    if (!(req.startPx > 0 && req.endPx > 0)) return { ok: false, error: 'Enter start and end prices' };
+    const ladder = this.scaleLadder(req.coin, req.sz, req.startPx, req.endPx, req.n, req.skew);
+    if (!ladder.length || ladder.some((l) => l.sz <= 0)) return { ok: false, error: 'Size too small for this many orders' };
+    if (!req.reduceOnly) {
+      const small = ladder.find((l) => l.px * l.sz < MIN_ORDER_NOTIONAL);
+      if (small) return { ok: false, error: `Each scale order must be worth at least $${MIN_ORDER_NOTIONAL} (smallest is $${(small.px * small.sz).toFixed(2)})` };
+    }
+    const oids: number[] = [];
+    for (const l of ladder) {
+      const r = this.placeOrder({ coin: req.coin, side: req.side, kind: 'limit', px: l.px, sz: l.sz, reduceOnly: req.reduceOnly, tif: 'Gtc' }, now);
+      if (!r.ok) return { ok: oids.length > 0, error: r.error, oids };
+      oids.push(r.oid!);
+    }
+    return { ok: true, oids, oid: oids[0] };
   }
 
   // ------------------------------------------------------------------- TWAP

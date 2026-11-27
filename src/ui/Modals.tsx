@@ -112,6 +112,54 @@ export function TransferModal({ onClose }: { onClose: () => void }) {
   );
 }
 
+/** TP/SL for a spot holding: sell triggers on the token's USDC pair */
+export function SpotTpslModal({ coin, onClose }: { coin: string; onClose: () => void }) {
+  const s = useStore();
+  const e = s.engine;
+  const a = e.asset(coin);
+  const base = a.spot!.base;
+  const held = e.state.spot[base] ?? 0;
+  const cb = e.state.spotCost[base];
+  const avg = cb && cb.sz > 0 ? cb.cost / cb.sz : 0;
+  const existing = e.state.orders.filter((o) => o.coin === coin && o.kind === 'trigger' && o.side === 'A' && (o.status === 'open' || o.status === 'pending'));
+  const [tp, setTp] = useState(String(existing.find((o) => o.trigger?.tpsl === 'tp')?.trigger?.triggerPx ?? ''));
+  const [sl, setSl] = useState(String(existing.find((o) => o.trigger?.tpsl === 'sl')?.trigger?.triggerPx ?? ''));
+  const [pct, setPct] = useState(100);
+  const sz = Math.floor(held * (pct / 100) * 10 ** a.szDecimals) / 10 ** a.szDecimals;
+  const mark = e.markPx(coin);
+  const pnlAt = (px: number) => (avg ? (px - avg) * sz : 0);
+  const apply = () => {
+    const tpN = Number(tp), slN = Number(sl);
+    if (tpN && tpN <= mark) return s.toast('reject', 'TP must be above the current price');
+    if (slN && slN >= mark) return s.toast('reject', 'SL must be below the current price');
+    for (const o of existing) e.cancelOrder(o.oid);
+    for (const [px, kind] of [[tpN, 'tp'], [slN, 'sl']] as const) {
+      if (!px) continue;
+      const r = e.placeOrder({ coin, side: 'A', kind: 'trigger', sz, trigger: { triggerPx: px, isMarket: true, tpsl: kind } });
+      if (!r.ok) s.toast('reject', `${kind.toUpperCase()}: ${r.error}`);
+    }
+    onClose();
+  };
+  return (
+    <Modal title={`${base} TP/SL`} onClose={onClose}>
+      <div className="kv"><span>Holding</span><span className="v num">{held} {base}</span></div>
+      <div className="kv"><span>Average cost</span><span className="v num">{avg ? fmtPx(avg, a.szDecimals, true) : '—'}</span></div>
+      <div className="kv"><span>Current price ({a.spot!.name})</span><span className="v num">{fmtPx(mark, a.szDecimals, true)}</span></div>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+        <input className="slider" type="range" min={1} max={100} value={pct} onChange={(ev) => setPct(Number(ev.target.value))} aria-label="Amount percent" />
+        <span className="num">{pct}%</span>
+      </div>
+      <div className="kv"><span>Amount to sell</span><span className="v num">{sz} {base}</span></div>
+      <div className="field"><label>TP Price</label><input value={tp} onChange={(ev) => setTp(ev.target.value)} /></div>
+      {Number(tp) > 0 && avg > 0 && <div className="kv"><span>PnL at TP</span><span className="v num">{fmtUsd(pnlAt(Number(tp)))}</span></div>}
+      <div className="field"><label>SL Price</label><input value={sl} onChange={(ev) => setSl(ev.target.value)} /></div>
+      {Number(sl) > 0 && avg > 0 && <div className="kv"><span>PnL at SL</span><span className="v num">{fmtUsd(pnlAt(Number(sl)))}</span></div>}
+      <div className="muted">Triggers on the spot mark price and sells as a market order (10% max slippage). If your {base} balance is fully sold, the other trigger is canceled.</div>
+      <button className="btn primary" onClick={apply} disabled={!sz}>Confirm</button>
+    </Modal>
+  );
+}
+
 export function TpslModal({ coin, onClose }: { coin: string; onClose: () => void }) {
   const s = useStore();
   const e = s.engine;

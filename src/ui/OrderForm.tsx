@@ -6,14 +6,13 @@ import { fmtNum, fmtPx, fmtUsd } from './format';
 import { bookClick } from './OrderBook';
 import { LeverageModal, TransferModal } from './Modals';
 
-type OType = 'market' | 'limit' | 'stop-market' | 'stop-limit' | 'tp-market' | 'tp-limit' | 'twap';
+type OType = 'market' | 'limit' | 'stop-market' | 'stop-limit' | 'tp-market' | 'tp-limit' | 'twap' | 'scale';
 
 const TYPE_LABEL: Record<OType, string> = {
   market: 'Market', limit: 'Limit', 'stop-market': 'Stop Market', 'stop-limit': 'Stop Limit',
-  'tp-market': 'Take Profit Market', 'tp-limit': 'Take Profit Limit', twap: 'TWAP',
+  'tp-market': 'Take Profit Market', 'tp-limit': 'Take Profit Limit', twap: 'TWAP', scale: 'Scale',
 };
-const PERP_PRO: OType[] = ['stop-market', 'stop-limit', 'tp-market', 'tp-limit', 'twap'];
-const SPOT_PRO: OType[] = ['twap'];
+const PRO_TYPES: OType[] = ['scale', 'stop-market', 'stop-limit', 'tp-market', 'tp-limit', 'twap'];
 
 export function OrderForm() {
   const s = useStore();
@@ -35,17 +34,23 @@ export function OrderForm() {
   const [twapH, setTwapH] = useState('0');
   const [twapM, setTwapM] = useState('30');
   const [randomize, setRandomize] = useState(false);
+  const [scStart, setScStart] = useState('');
+  const [scEnd, setScEnd] = useState('');
+  const [scN, setScN] = useState('10');
+  const [scSkew, setScSkew] = useState('1');
   const [levOpen, setLevOpen] = useState(false);
   const [xferOpen, setXferOpen] = useState(false);
   const spot = m?.spot;
 
-  useEffect(() => { setPxStr(''); setTrigStr(''); setSzStr(''); setPct(0); setTpStr(''); setSlStr(''); }, [coin]);
+  useEffect(() => { setPxStr(''); setTrigStr(''); setSzStr(''); setPct(0); setTpStr(''); setSlStr(''); setScStart(''); setScEnd(''); }, [coin]);
+  useEffect(() => { if (spot) setReduceOnly(false); }, [spot]);
   useEffect(() => {
-    if (spot) { setReduceOnly(false); setTpsl(false); if (type !== 'market' && type !== 'limit' && type !== 'twap') setType('market'); }
-  }, [spot, type]);
-  useEffect(() => {
-    bookClick.setPrice = (px) => { setPxStr(String(px)); if (type === 'market' || type === 'twap') setType('limit'); };
-  }, [type]);
+    bookClick.setPrice = (px) => {
+      if (type === 'scale') { if (!scStart) setScStart(String(px)); else setScEnd(String(px)); return; }
+      setPxStr(String(px));
+      if (type === 'market' || type === 'twap') setType('limit');
+    };
+  }, [type, scStart]);
 
   if (!m) return <div className="empty">Loading markets…</div>;
   const szD = m.szDecimals;
@@ -56,11 +61,18 @@ export function OrderForm() {
   const pos = sp ? undefined : e.state.positions[coin];
   const sum = e.summary();
   const isTwap = type === 'twap';
+  const isScale = type === 'scale';
   const isTrigger = type.startsWith('stop') || type.startsWith('tp');
   const needsLimitPx = type === 'limit' || type.endsWith('-limit');
   const limitPx = Number(pxStr) || 0;
   const triggerPx = Number(trigStr) || 0;
-  const refPx = needsLimitPx ? limitPx || mid : isTrigger ? triggerPx || mid : isTwap ? mid : side === 'B' ? book?.asks[0]?.px ?? mid : book?.bids[0]?.px ?? mid;
+  const scStartPx = Number(scStart) || 0, scEndPx = Number(scEnd) || 0;
+  const scN_ = Math.floor(Number(scN) || 0), scSkew_ = Number(scSkew) || 0;
+  const refPx = needsLimitPx ? limitPx || mid
+    : isTrigger ? triggerPx || mid
+    : isScale ? (scStartPx && scEndPx ? (scStartPx + scEndPx) / 2 : scStartPx || mid)
+    : isTwap ? mid
+    : side === 'B' ? book?.asks[0]?.px ?? mid : book?.bids[0]?.px ?? mid;
   const baseName = spot?.base ?? coin;
   const quoteName = spot?.quote ?? 'USD';
   const takerFee = sp ? e.state.settings.spotTakerFee : e.state.settings.takerFee;
@@ -91,7 +103,11 @@ export function OrderForm() {
     const v = Number(szStr) || 0;
     return roundSize(unit === 'usd' ? (refPx ? v / refPx : 0) : v, szD);
   })();
-  const notional = sz * refPx;
+  const ladder = isScale && sz > 0 ? e.scaleLadder(coin, sz, scStartPx, scEndPx, scN_, scSkew_) : [];
+  const notional = isScale && ladder.length ? ladder.reduce((a, l) => a + l.px * l.sz, 0) : sz * refPx;
+  const scaleAvg = ladder.length ? notional / sz : 0;
+  // TP/SL attached to an entry: perps any side; spot only on buys (it sells what you bought)
+  const canAttachTpsl = !isTrigger && !isTwap && !isScale && !reduceOnly && (!sp || side === 'B');
   const incSz = Math.max(0, sz - opp);
   const marginReq = sp ? 0 : (incSz * refPx) / ls.leverage;
   const est = (type === 'market' || isTwap) && sz > 0 ? e.estimateTaker(coin, side, isTwap ? sz / twapSlices() : sz) : null;
@@ -135,10 +151,13 @@ export function OrderForm() {
   };
 
   const submit = () => {
+    // TP/SL activate when the entry fills, sized to what was filled (spot: what you received)
+    const attached = tpsl && canAttachTpsl ? { tp: Number(tpStr) || undefined, sl: Number(slStr) || undefined } : undefined;
     let r;
-    if (isTwap) r = e.placeTwap({ coin, side, sz, minutes: twapMinutes, randomize, reduceOnly });
-    else if (type === 'market') r = e.placeOrder({ coin, side, sz, reduceOnly, kind: 'market' });
-    else if (type === 'limit') r = e.placeOrder({ coin, side, sz, reduceOnly, kind: 'limit', px: limitPx, tif });
+    if (isScale) r = e.placeScale({ coin, side, sz, startPx: scStartPx, endPx: scEndPx, n: scN_, skew: scSkew_, reduceOnly });
+    else if (isTwap) r = e.placeTwap({ coin, side, sz, minutes: twapMinutes, randomize, reduceOnly });
+    else if (type === 'market') r = e.placeOrder({ coin, side, sz, reduceOnly, kind: 'market', tpsl: attached });
+    else if (type === 'limit') r = e.placeOrder({ coin, side, sz, reduceOnly, kind: 'limit', px: limitPx, tif, tpsl: attached });
     else {
       r = e.placeOrder({
         coin, side, sz, reduceOnly, kind: 'trigger', px: needsLimitPx ? limitPx : 0,
@@ -146,12 +165,6 @@ export function OrderForm() {
       });
     }
     if (!r.ok) { s.toast('reject', r.error ?? 'Rejected'); return; }
-    if (tpsl && !sp && !isTrigger && !isTwap && !reduceOnly) {
-      const exit: Side = side === 'B' ? 'A' : 'B';
-      const tp = Number(tpStr), sl = Number(slStr);
-      if (tp > 0) e.placeOrder({ coin, side: exit, kind: 'trigger', sz, trigger: { triggerPx: tp, isMarket: true, tpsl: 'tp', positionTpsl: true } });
-      if (sl > 0) e.placeOrder({ coin, side: exit, kind: 'trigger', sz, trigger: { triggerPx: sl, isMarket: true, tpsl: 'sl', positionTpsl: true } });
-    }
     setSzStr('');
     setPct(0);
   };
@@ -165,8 +178,20 @@ export function OrderForm() {
   if (sp && sz > maxSz + 1e-12) error = `Insufficient ${side === 'B' ? quoteName : baseName}`;
   if (!sp && !reduceOnly && marginReq > sum.available + 1e-9 && sz > 0) error = 'Insufficient margin';
   if (reduceOnly && !opp) error = 'No position to reduce';
+  if (isScale) {
+    if (!scStartPx || !scEndPx) error = 'Enter start and end prices';
+    else if (scN_ < 2 || scN_ > 100) error = 'Total orders must be 2 – 100';
+    else if (!(scSkew_ >= 0.01 && scSkew_ <= 100)) error = 'Size skew must be 0.01 – 100';
+    else if (sz > 0 && !reduceOnly && ladder.some((l) => l.px * l.sz < MIN_ORDER_NOTIONAL)) error = `Each order must be ≥ $${MIN_ORDER_NOTIONAL}`;
+  }
+  if (tpsl && canAttachTpsl) {
+    const tp = Number(tpStr), sl = Number(slStr);
+    const ref = type === 'limit' ? limitPx : mid;
+    if (side === 'B' && ((tp && tp <= ref) || (sl && sl >= ref))) error = 'Long TP must be above and SL below entry';
+    if (side === 'A' && ((tp && tp >= ref) || (sl && sl <= ref))) error = 'Short TP must be below and SL above entry';
+  }
 
-  const proTypes = sp ? SPOT_PRO : PERP_PRO;
+  const proTypes = PRO_TYPES;
   const isPro = proTypes.includes(type);
   const buyLabel = sp ? 'Buy' : 'Buy / Long';
   const sellLabel = sp ? 'Sell' : 'Sell / Short';
@@ -214,7 +239,21 @@ export function OrderForm() {
         <div className="field">
           <label>Trigger Price</label>
           <input inputMode="decimal" value={trigStr} onChange={(ev) => setTrigStr(ev.target.value)} placeholder={fmtPx(e.markPx(coin), szD, sp)} />
-          <span className="unit">USD</span>
+          <span className="unit">{sp ? quoteName : 'USD'}</span>
+        </div>
+      )}
+      {isTrigger && (
+        <div className="faint">
+          {side === 'A'
+            ? (type.startsWith('tp') ? 'Sells when the mark price rises to the trigger.' : 'Sells when the mark price falls to the trigger.')
+            : (type.startsWith('tp') ? 'Buys when the mark price falls to the trigger.' : 'Buys when the mark price rises to the trigger.')}
+          {sp && side === 'A' ? ` Sells up to your ${baseName} balance at trigger time; canceled if you sell it all.` : ''}
+        </div>
+      )}
+      {isScale && (
+        <div style={{ display: 'flex', gap: 8 }}>
+          <div className="field" style={{ flex: 1 }}><label>Start</label><input inputMode="decimal" value={scStart} onChange={(ev) => setScStart(ev.target.value)} placeholder={fmtPx(mid, szD, sp)} /></div>
+          <div className="field" style={{ flex: 1 }}><label>End</label><input inputMode="decimal" value={scEnd} onChange={(ev) => setScEnd(ev.target.value)} /></div>
         </div>
       )}
       {needsLimitPx && (
@@ -238,6 +277,12 @@ export function OrderForm() {
       </div>
       {unit === 'usd' && sz > 0 && <div className="kv"><span>Size in {baseName}</span><span className="v num">{sz.toFixed(szD)}</span></div>}
 
+      {isScale && (
+        <div style={{ display: 'flex', gap: 8 }}>
+          <div className="field" style={{ flex: 1 }}><label>Total orders</label><input inputMode="numeric" value={scN} onChange={(ev) => setScN(ev.target.value)} /></div>
+          <div className="field" style={{ flex: 1 }} title="Size of the last order ÷ size of the first. 1 = equal sizes"><label>Size skew</label><input inputMode="decimal" value={scSkew} onChange={(ev) => setScSkew(ev.target.value)} /></div>
+        </div>
+      )}
       {isTwap && (
         <>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -258,14 +303,19 @@ export function OrderForm() {
           </select>
         )}
       </div>
-      {!sp && !isTrigger && !isTwap && !reduceOnly && (
+      {canAttachTpsl && (
         <label className="check"><input type="checkbox" checked={tpsl} onChange={(ev) => setTpsl(ev.target.checked)} /> Take Profit / Stop Loss</label>
       )}
-      {tpsl && !sp && !isTrigger && !isTwap && !reduceOnly && (
-        <div style={{ display: 'flex', gap: 8 }}>
-          <div className="field" style={{ flex: 1 }}><label>TP</label><input inputMode="decimal" value={tpStr} onChange={(ev) => setTpStr(ev.target.value)} /></div>
-          <div className="field" style={{ flex: 1 }}><label>SL</label><input inputMode="decimal" value={slStr} onChange={(ev) => setSlStr(ev.target.value)} /></div>
-        </div>
+      {tpsl && canAttachTpsl && (
+        <>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <div className="field" style={{ flex: 1 }}><label>TP</label><input inputMode="decimal" value={tpStr} onChange={(ev) => setTpStr(ev.target.value)} /></div>
+            <div className="field" style={{ flex: 1 }}><label>SL</label><input inputMode="decimal" value={slStr} onChange={(ev) => setSlStr(ev.target.value)} /></div>
+          </div>
+          <div className="faint">
+            Activates when this order fills. {sp ? `Sells the ${baseName} you receive (after fees) as a market order.` : 'Closes the whole position as a market order.'}
+          </div>
+        </>
       )}
 
       <button className={`submit ${side === 'B' ? 'buy' : 'sell'}`} disabled={!sz || !!error} onClick={submit}>
@@ -275,6 +325,13 @@ export function OrderForm() {
       {!sp && !isTwap && <div className="kv"><span>Liquidation Price</span><span className="v num warn">{estLiq ? fmtPx(estLiq, szD) : 'N/A'}</span></div>}
       <div className="kv"><span>Order Value</span><span className="v num">{sz ? fmtUsd(notional) : 'N/A'}</span></div>
       {!sp && <div className="kv"><span>Margin Required</span><span className="v num">{sz ? fmtUsd(marginReq) : 'N/A'}</span></div>}
+      {isScale && ladder.length > 0 && (
+        <>
+          <div className="kv"><span>Average price</span><span className="v num">{fmtPx(scaleAvg, szD, sp)}</span></div>
+          <div className="kv"><span>First order</span><span className="v num">{ladder[0].sz.toFixed(szD)} @ {fmtPx(ladder[0].px, szD, sp)}</span></div>
+          <div className="kv"><span>Last order</span><span className="v num">{ladder[ladder.length - 1].sz.toFixed(szD)} @ {fmtPx(ladder[ladder.length - 1].px, szD, sp)}</span></div>
+        </>
+      )}
       {isTwap && (
         <>
           <div className="kv"><span>Sub-orders</span><span className="v num">{twapSlices()} × every 30s</span></div>
